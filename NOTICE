@@ -2,11 +2,14 @@ stracewave includes material derived from straceprof
 (https://github.com/akawashiro/straceprof):
 
   examples/uv_build.json     converted from public/uv_build.log
-  examples/ruby_build.json   converted from public/ruby_build.log
   examples/linux_build.json  converted from src/linux_build_log.txt
 
 The conversion was done with tools/convert.mjs. stracewave also reads the
 same strace log format that straceprof defines.
+
+examples/ruby_build.json was recorded for stracewave (Ruby v3_4_3, make -j48)
+following the recipe in straceprof's build-log-example/ruby.Dockerfile, with
+fork tracing added.
 
 straceprof is distributed under the following license:
 

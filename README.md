@@ -39,6 +39,11 @@ Logs recorded with straceprof's shorter command (without `clone,clone3,fork,vfor
 - **Ridges**: one per row of the process tree. Height is how many of that row's processes are running, on a square-root scale so a single long-running process stays visible next to a burst of a hundred.
 - **Light sheet**: the time slice. Press play, drag the bars in the timeline, or click the 3D view to move it. The line on the sheet joins every row's height at that instant.
 - **Slice panel**: the processes alive at the slice, longest-running first. Click one to copy its command.
+- **Back wall**: busy processes across all rows, with the core count as a line. Where the wall sits far under the line, the machine is idle.
+- **White ribbons and labels**: the long links of the critical chain, riding on the ridge that holds each process.
+- **Name tags**: the busy processes that have been running longest at the slice.
+- **Arcs**: when a process starts, a short-lived arc runs from its parent's ridge to its own.
+- **Row tools** (hover a timeline row): ▤ unfolds the row into one block per process, stacked like a Gantt chart, with failed ones in red; hover a block for its command. S shows only the soloed rows in 3D, M hides a row. Double-clicking a ridge also unfolds it.
 - **Timeline**: green has finished, yellow is running now, dots have not started. The footer counts individual processes. A white underline marks the critical chain.
 - **Minimap**: the strip above the timeline shows busy processes over the whole trace against a dashed core line. Drag across it to zoom the timeline and the 3D view into that range, drag the window to pan, double-click to show everything.
 - **Busy and cores**: a process counts as busy only while none of its children is alive, since a parent waiting on a child is idle. The core count comes from a `-jN` flag in the trace when there is one, otherwise it is estimated; the Cores box overrides it. Stretches where busy sits far below the core line are where the build is not using the machine.
@@ -65,7 +70,7 @@ Logs recorded with straceprof's shorter command (without `clone,clone3,fork,vfor
 
 ## Known limits
 
-- The three bundled examples were recorded without fork records, so their trees are approximate.
+- The uv and Linux kernel examples were recorded without fork records, so their trees are approximate. The Ruby example has them.
 - Busy counts processes, not threads, so a multi-threaded compiler counts once.
 - `execveat` is not parsed.
 - The whole log is read into memory, so multi-gigabyte logs will not load.

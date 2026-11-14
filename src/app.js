@@ -19,6 +19,8 @@ const S = {
   starts: null, ends: null, failEnds: null,
   v0: 0, v1: 1, stamp: 0,          // visible time range; stamp invalidates cached series when it changes
   busy: null, cores: 1, coresFrom: '', chain: [], rowOf: new Map(),
+  solo: new Set(), mute: new Set(), unfolded: new Set(),   // per-row view switches, by node id
+  rows3: [], r3: [], row3Of: new Map(),                   // rows the 3D view shows, and how timeline rows and tree nodes map onto them
 };
 const dirty = { tl: true, ui: true };
 let view3d = null;
@@ -259,6 +261,7 @@ function showTrace(key, d) {
   S.colorOf = new Map([...total.entries()].sort((a, b) => b[1] - a[1]).slice(0, SERIES.length).map(([name], i) => [name, SERIES[i]]));
   S.v0 = 0; S.v1 = S.span; S.stamp++;
   S.exact = !!d.exact;
+  S.solo.clear(); S.mute.clear(); S.unfolded.clear();
   S.root = buildTree(S.procs);
   analyse();
   S.starts = Float64Array.from(S.procs, (p) => p.start).sort();
@@ -316,7 +319,7 @@ async function openFile(file) {
 
 // ---------------------------------------------------------------- timeline (terminal-style tree)
 const tlLabels = $('#tlLabels'), tlCanvas = $('#tlCanvas'), tlCtx = tlCanvas.getContext('2d');
-let rowEls = [], tlCols = 0, tlW = 0;
+let rowEls = [], rowParts = [], tlCols = 0, tlW = 0;
 
 function rowsChanged() {
   S.rows = visibleRows();
@@ -325,14 +328,26 @@ function rowsChanged() {
     if (S.expanded.has(n.id)) { if (!n.isFold) S.rowOf.set(n, i); }
     else (function mark(x) { if (!x.isFold) S.rowOf.set(x, i); x.children.forEach(mark); })(n);
   });
+  // solo and mute decide which rows reach the 3D view; the timeline always lists every row
+  const ids = new Set(S.rows.map((n) => n.id));
+  for (const set of [S.solo, S.mute, S.unfolded]) for (const id of set) if (!ids.has(id)) set.delete(id);
+  S.rows3 = S.rows.filter((n) => (S.solo.size ? S.solo.has(n.id) : !S.mute.has(n.id)));
+  S.r3 = S.rows.map((n) => S.rows3.indexOf(n));
+  S.row3Of = new Map();
+  for (const [node, i] of S.rowOf) if (S.r3[i] >= 0) S.row3Of.set(node, S.r3[i]);
+  const tool = (act, glyph, title, on) => '<button type="button" class="tool" data-act="' + act + '" aria-pressed="' + on + '" title="' + title + '">' + glyph + '</button>';
   tlLabels.innerHTML = '<div class="axis-pad"><span>Timeline</span><button type="button" class="zoom-reset" id="zoomReset" title="Show the whole trace" hidden></button></div>' + S.rows.map((n, i) => {
     const has = n.children.length > 0, open = S.expanded.has(n.id), k = n.procs.length;
-    return '<button type="button" class="row" data-i="' + i + '" style="--d:' + n.vdepth + '"' + (has ? ' aria-expanded="' + open + '"' : '') + '>' +
+    return '<div class="row' + (S.r3[i] < 0 ? ' off' : '') + '" data-i="' + i + '" style="--d:' + n.vdepth + '">' +
+      '<button type="button" class="rowmain"' + (has ? ' aria-expanded="' + open + '"' : '') + '>' +
       '<span class="st" data-st=""></span><span class="caret">' + (has ? (open ? '▾' : '▸') : '') + '</span>' +
       '<i class="chip" style="background:' + colorFor(n.name) + '"></i><span class="nm">' + esc(n.name) + '</span>' +
-      '<span class="ct">(' + k.toLocaleString() + (k === 1 ? ' unit' : ' units') + ')</span><span class="fl"></span></button>';
+      '<span class="ct">(' + k.toLocaleString() + (k === 1 ? ' unit' : ' units') + ')</span><span class="fl"></span></button>' +
+      '<span class="tools">' + tool('blocks', '▤', 'Show each process as a block in 3D', S.unfolded.has(n.id)) +
+      tool('solo', 'S', 'Solo: show only the soloed rows in 3D', S.solo.has(n.id)) + tool('mute', 'M', 'Mute: hide this row in 3D', S.mute.has(n.id)) + '</span></div>';
   }).join('');
   rowEls = [...tlLabels.querySelectorAll('.row')];
+  rowParts = rowEls.map((el) => ({ st: el.querySelector('.st'), fl: el.querySelector('.fl') }));
   syncZoom();
   sizeTimeline();
   if (view3d) view3d.setRows();
@@ -441,10 +456,24 @@ function updateUI() {
     '<span><span class="k-fail">×</span> <b>' + failed.toLocaleString() + '</b> failed</span>';
   const GLYPH = { waiting: '·', running: '►', idle: '►', done: '✓' };
   for (let i = 0; i < rowEls.length; i++) {
-    const n = S.rows[i], el = rowEls[i], st = stateOf(n, t), sEl = el.firstChild;
+    const n = S.rows[i], st = stateOf(n, t), sEl = rowParts[i].st;
     if (sEl.dataset.st !== st) { sEl.dataset.st = st; sEl.textContent = GLYPH[st]; }
-    const f = ub(n.failEnds, t), fEl = el.lastChild, txt = f ? '×' + f : '';
+    const f = ub(n.failEnds, t), fEl = rowParts[i].fl, txt = f ? '×' + f : '';
     if (fEl.textContent !== txt) fEl.textContent = txt;
+  }
+  // name tags in 3D: the busy processes that have been running longest at the slice, one per row
+  if (view3d) {
+    const busy = [];
+    for (const a of S.busy.procs) { if (a.start > t) break; if (t < a.end && t - a.p.start >= 0.3) busy.push(a.p); }
+    busy.sort((x, y) => x.start - y.start);
+    const tags = [], used = new Set();
+    for (const p of busy) {
+      const k = S.row3Of.get(p.node);
+      if (k === undefined || used.has(k)) continue;
+      used.add(k); tags.push({ k, text: shortLabel(p) + ' · ' + fmtD(t - p.start) });
+      if (tags.length === 3) break;
+    }
+    view3d.setTags(tags);
   }
   $('#clockT').textContent = fmtT(t);
   $('#sliceT').textContent = fmtT(t);
@@ -475,6 +504,11 @@ function showTip(html, x, y) {
   tip.style.transform = 'translate(' + Math.max(8, left) + 'px,' + Math.max(8, top) + 'px)';
 }
 const hideTip = () => { tip.hidden = true; };
+function procTip(p) {
+  return '<div class="p">' + esc(shortLabel(p)) + '</div>' +
+    '<div>' + fmtT(p.start) + ' → ' + fmtT(p.end) + ' · ' + fmtD(p.end - p.start) + (p.exit ? ' · exit ' + (p.exit < 0 ? 'by signal' : p.exit) : '') + '</div>' +
+    (p.cmd ? '<div class="c">' + esc(p.cmd) + '</div>' : '');
+}
 function nodeTip(n, t) {
   const live = liveCount(n, t), p = longestLive(n, t);
   return '<div class="p">' + esc(pathOf(n)) + '</div>' +
@@ -487,7 +521,7 @@ function setHover(i) {
   S.hover = i;
   if (rowEls[i]) rowEls[i].classList.add('hot');
   dirty.tl = true;
-  if (view3d) view3d.setHover(i);
+  if (view3d) view3d.setHover(i >= 0 ? S.r3[i] : -1);
 }
 function setT(t) {
   S.t = clamp(t, S.v0, S.v1);
@@ -502,11 +536,22 @@ function toast(text, ms = 1600) { const el = $('#toast'); el.textContent = text;
 tlLabels.addEventListener('click', (e) => {
   if (e.target.closest('#zoomReset')) { setView(0, S.span); return; }
   const b = e.target.closest('.row'); if (!b) return;
-  const n = S.rows[+b.dataset.i]; if (!n || !n.children.length) return;
+  const n = S.rows[+b.dataset.i]; if (!n) return;
+  const tl = e.target.closest('.tool');
+  if (tl) {
+    const act = tl.dataset.act, set = { blocks: S.unfolded, solo: S.solo, mute: S.mute }[act];
+    if (set.has(n.id)) set.delete(n.id); else set.add(n.id);
+    if (act === 'solo') S.mute.delete(n.id);
+    if (act === 'mute') S.solo.delete(n.id);
+    S.hover = -1;
+    rowsChanged();
+    return;
+  }
+  if (!n.children.length) return;
   if (S.expanded.has(n.id)) S.expanded.delete(n.id); else S.expanded.add(n.id);
   S.hover = -1;
   rowsChanged();
-  const again = rowEls[S.rows.indexOf(n)]; if (again) again.focus({ preventScroll: true });
+  const again = rowEls[S.rows.indexOf(n)]; if (again) again.querySelector('.rowmain').focus({ preventScroll: true });
 });
 tlLabels.addEventListener('pointerover', (e) => { const b = e.target.closest('.row'); setHover(b ? +b.dataset.i : -1); });
 tlLabels.addEventListener('pointerleave', () => setHover(-1));
@@ -623,7 +668,7 @@ async function init3D() {
   controls.addEventListener('start', () => { userMoved = true; });
   // Back the camera off along the home direction until the whole table, with its labels, is in frame.
   function resetView() {
-    const xa = X0 - 3.2, xb = X0 + W + 0.6, za = -D / 2 - 0.8, zb = D / 2 + 1.9, q = new THREE.Vector3();
+    const xa = X0 - 3.2, xb = X0 + W + 2.2, za = zWall - 0.6, zb = D / 2 + 1.9, q = new THREE.Vector3();
     controls.target.set((xa + xb) / 2, 0.7, 0);
     for (let dist = 14; dist < 120; dist += 1) {
       camera.position.copy(controls.target).addScaledVector(HOME_DIR, dist);
@@ -692,7 +737,18 @@ async function init3D() {
   const overlayScene = new THREE.Scene(), occluders = new THREE.Group();
   const occluderMat = new THREE.MeshBasicMaterial({ colorWrite: false });
   overlayScene.add(occluders);
-  let bodies = [], crests = [], rests = [], beads = [], series = [], rowLabels = [], tickLabels = [];
+  const wall = new THREE.Group(); scene.add(wall);
+  // per-row state, indexed like S.rows3
+  let gl = [], pickables = [], beads = [], rowLabels = [], tickLabels = [], fixedLabels = [], tagEls = [], tags = [], zWall = 0, wallSeries = null;
+  // spawn arcs: a short-lived line from the parent's ridge to the child's, drawn for processes started just behind the slice
+  const ARC_MAX = 64, ARC_SEG = 10;
+  const arcGeo = new THREE.BufferGeometry();
+  arcGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ARC_MAX * ARC_SEG * 6), 3));
+  arcGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(ARC_MAX * ARC_SEG * 6), 3));
+  const arcs = new THREE.LineSegments(arcGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+  arcs.frustumCulled = false; scene.add(arcs);
+  const threeColor = new Map();
+  const colOf = (name) => { let c = threeColor.get(name); if (!c) { c = new THREE.Color(colorFor(name)); threeColor.set(name, c); } return c; };
 
   // Fill gradient for ridge faces: near black at the baseline, brightest just under the crest.
   const FILL = 0.85;
@@ -728,21 +784,21 @@ async function init3D() {
     return tex;
   }
 
-  function sampleRow(i, t) {
-    const s = series[i], f = clamp(((t - S.v0) / (S.v1 - S.v0)) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
+  function heightAt(s, t) {
+    const f = clamp(((t - S.v0) / (S.v1 - S.v0)) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
     return Y0 + H * hOf(s[a] + (s[b] - s[a]) * (f - a));
   }
+  const sampleRow = (k, t) => (gl[k].laneH ? Y0 + Math.min(H, gl[k].laneH * liveCount(gl[k].node, t)) : heightAt(gl[k].series, t));
 
-  function buildRidge(n, i) {
-    const s = seriesOf(n, BINS_3D), P = BINS_3D + 2, col = new THREE.Color(colorFor(n.name));
-    const th = Math.min(0.07, dz * 0.22), zf = th / 2, zb = -th / 2, lw = 0.05;
+  // A ridge: a face that glows from the baseline up, and a crest that is bright where the ridge rises and dim along the baseline.
+  function makeRidge(s, col, th, fill) {
+    const P = BINS_3D + 2, zf = th / 2, zb = -th / 2, lw = 0.05;
     const xs = new Float32Array(P), hs = new Float32Array(P);
     for (let k = 0; k < P; k++) {
       const b = clamp(k - 1, 0, BINS_3D - 1);
       xs[k] = X0 + W * (k === 0 ? 0 : k === P - 1 ? 1 : (b + 0.5) / BINS_3D);
       hs[k] = Y0 + H * hOf(s[b]);
     }
-    // body: front and back faces with a dark-to-colour gradient
     const pos = new Float32Array(P * 12), uv = new Float32Array(P * 8), nor = new Float32Array(P * 12), idx = [];
     for (let k = 0; k < P; k++) {
       const o = k * 12, x = xs[k], y = hs[k], top = clamp(0.3 + 1.4 * (y - Y0) / H, 0.3, 1);
@@ -756,8 +812,7 @@ async function init3D() {
     bodyGeo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     bodyGeo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
     bodyGeo.setIndex(idx);
-    const body = new THREE.Mesh(bodyGeo, new THREE.MeshStandardMaterial({ color: col.clone().multiplyScalar(0.05), roughness: 0.4, metalness: 0, emissive: col, emissiveMap: fillTex, emissiveIntensity: FILL }));
-    // crest: the glowing top strip plus an outline ribbon on both faces
+    const body = new THREE.Mesh(bodyGeo, new THREE.MeshStandardMaterial({ color: col.clone().multiplyScalar(0.05), roughness: 0.4, metalness: 0, emissive: col, emissiveMap: fillTex, emissiveIntensity: fill }));
     const cp = new Float32Array(P * 18), ci = [], cb = [];
     for (let k = 0; k < P; k++) {
       const x = xs[k], y = hs[k], kp = Math.max(0, k - 1), kn = Math.min(P - 1, k + 1);
@@ -772,83 +827,207 @@ async function init3D() {
     const cpAttr = new THREE.BufferAttribute(cp, 3);
     const mkCrest = (index, intensity) => {
       const g = new THREE.BufferGeometry(); g.setAttribute('position', cpAttr); g.setIndex(index.length ? index : [0, 0, 0]); g.computeVertexNormals();
-      const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: col, emissiveIntensity: intensity, roughness: 1, side: THREE.DoubleSide }));
-      m.userData.base = intensity; return m;
+      return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: col, emissiveIntensity: intensity, roughness: 1, side: THREE.DoubleSide }));
     };
     const crest = mkCrest(ci, 1.35), rest = mkCrest(cb, 0.16);
-    const bead = new THREE.Mesh(beadGeo, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: col.clone().lerp(new THREE.Color(0xffffff), 0.35), emissiveIntensity: 3, roughness: 1 }));
-    body.userData.i = i;
-    for (const m of [body, crest, rest]) { m.position.z = zOf(i); ridges.add(m); }
-    const occ = new THREE.Mesh(bodyGeo, occluderMat); occ.position.z = zOf(i); occluders.add(occ);
-    slice.add(bead);
-    bodies.push(body); crests.push(crest); rests.push(rest); beads.push(bead); series.push(s);
+    return {
+      meshes: [body, crest, rest], solids: [body], hs, th,
+      tone(hot, dim) {
+        body.material.emissiveIntensity = fill * (hot ? 1.9 : dim ? 0.55 : 1);
+        crest.material.emissiveIntensity = hot ? 2.6 : dim ? 0.7 : 1.35;
+        rest.material.emissiveIntensity = hot ? 0.9 : 0.16;
+      },
+    };
+  }
+
+  // A row unfolded into its processes: one block each, stacked into lanes like a Gantt chart. Failed ones are red.
+  function makeBlocks(n, col, th) {
+    const minDur = (S.v1 - S.v0) / 700;
+    let ps = n.procs.filter((p) => p.end > S.v0 && p.start < S.v1 && p.end - p.start >= minDur);
+    if (ps.length > 4000) ps = ps.sort((a, b) => (b.end - b.start) - (a.end - a.start)).slice(0, 4000).sort((a, b) => a.start - b.start);
+    const lanes = [], lane = new Array(ps.length);
+    ps.forEach((p, i) => { let j = 0; while (j < lanes.length && lanes[j] > p.start) j++; lanes[j] = p.end; lane[i] = j; });
+    const laneH = Math.min(0.17, (H * 0.96) / Math.max(1, lanes.length)), zh = Math.max(th, 0.06) / 2;
+    const build = (list, emissive) => {
+      const pos = new Float32Array(list.length * 24), idx = new Uint32Array(list.length * 36);
+      list.forEach(([p, j], b) => {
+        let x0 = xOf(Math.max(p.start, S.v0)), x1 = xOf(Math.min(p.end, S.v1));
+        const gap = Math.min(0.012, (x1 - x0) * 0.2); x0 += gap; x1 -= gap;
+        const y0 = Y0 + j * laneH + laneH * 0.1, y1 = Y0 + (j + 1) * laneH - laneH * 0.1;
+        pos.set([x0, y0, zh, x1, y0, zh, x1, y1, zh, x0, y1, zh, x0, y0, -zh, x1, y0, -zh, x1, y1, -zh, x0, y1, -zh], b * 24);
+        const o = b * 8;
+        idx.set([0, 1, 2, 0, 2, 3, 5, 4, 7, 5, 7, 6, 3, 2, 6, 3, 6, 7, 4, 5, 1, 4, 1, 0, 1, 5, 6, 1, 6, 2, 4, 0, 3, 4, 3, 7].map((v) => v + o), b * 36);
+      });
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setIndex(new THREE.BufferAttribute(idx, 1));
+      g.computeVertexNormals();
+      const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: emissive.clone().multiplyScalar(0.06), roughness: 0.45, emissive, emissiveIntensity: 0.8 }));
+      m.userData.procs = list.map(([p]) => p);
+      return m;
+    };
+    const all = ps.map((p, i) => [p, lane[i]]), ok = all.filter(([p]) => p.exit === 0), bad = all.filter(([p]) => p.exit !== 0);
+    const meshes = [];
+    if (ok.length) meshes.push(build(ok, col));
+    if (bad.length) meshes.push(build(bad, new THREE.Color(0xd03b3b)));
+    return {
+      meshes, solids: meshes, laneH, th,
+      tone(hot, dim) { for (const m of meshes) m.material.emissiveIntensity = hot ? 1.5 : dim ? 0.45 : 0.8; },
+    };
   }
 
   function setRows() {
-    for (const m of [...bodies, ...crests, ...rests]) { m.geometry.dispose(); m.material.dispose(); }
-    ridges.clear(); occluders.clear();
+    for (const g of [ridges, wall]) { for (const m of g.children) { m.geometry.dispose(); m.material.dispose(); } g.clear(); }
+    occluders.clear();
     for (const b of beads) { slice.remove(b); b.material.dispose(); }
     for (const t of ticks.children) t.geometry.dispose();
-    ticks.clear(); bodies = []; crests = []; rests = []; beads = []; series = [];
-    const R = S.rows.length;
+    ticks.clear(); gl = []; pickables = []; beads = [];
+    threeColor.clear();
+    const R = S.rows3.length;
     dz = clamp(11 / Math.max(1, R), 0.26, 0.8); D = dz * Math.max(0, R - 1);
-    S.rows.forEach(buildRidge);
+    zWall = -D / 2 - Math.max(1.1, dz * 1.7);
+    const th = Math.min(0.07, dz * 0.22);
+    const place = (rec, z, group) => {
+      for (const m of rec.meshes) { m.position.z = z; group.add(m); }
+      for (const m of rec.solids) { const occ = new THREE.Mesh(m.geometry, occluderMat); occ.position.z = z; occluders.add(occ); }
+    };
+    const mkBead = (color, z) => {
+      const b = new THREE.Mesh(beadGeo, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: color.clone().lerp(new THREE.Color(0xffffff), 0.35), emissiveIntensity: 3, roughness: 1 }));
+      b.position.z = z; slice.add(b); beads.push(b);
+    };
+    S.rows3.forEach((n, k) => {
+      const col = colOf(n.name), unfolded = S.unfolded.has(n.id);
+      const rec = unfolded ? makeBlocks(n, col, th) : makeRidge(seriesOf(n, BINS_3D), col, th, FILL);
+      rec.node = n; rec.series = seriesOf(n, BINS_3D);
+      place(rec, zOf(k), ridges);
+      for (const m of rec.solids) { m.userData.k = k; pickables.push(m); }
+      mkBead(col, zOf(k));
+      gl.push(rec);
+    });
+
+    // back wall: busy processes in total, with the core count as a line across it
+    wallSeries = seriesOf(S.busy, BINS_3D);
+    const wallCol = new THREE.Color(0x9aa9c2);
+    place(makeRidge(wallSeries, wallCol, 0.05, FILL * 0.5), zWall, wall);
+    const coreY = Y0 + H * hOf(S.cores);
+    const coreLine = new THREE.Mesh(new THREE.BoxGeometry(W + 0.5, 0.016, 0.016), new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x8fd3ff, emissiveIntensity: 1.7, roughness: 1 }));
+    coreLine.position.set(X0 + W / 2, coreY, zWall + 0.06); wall.add(coreLine);
+    mkBead(wallCol, zWall);
+
+    // critical chain: a white ribbon riding just above the ridge of each long link
+    const cpos = [], cidx = [], crit = [];
+    for (const seg of S.chain) {
+      const k = S.row3Of.get(seg.p.node), a = Math.max(seg.start, S.v0), b = Math.min(seg.end, S.v1);
+      if (k === undefined || b <= a) continue;
+      const rec = gl[k], z = zOf(k) + rec.th / 2 + 0.006, n = Math.max(2, Math.ceil(((b - a) / (S.v1 - S.v0)) * BINS_3D));
+      const base = cpos.length / 3;
+      let top = 0;
+      for (let i = 0; i <= n; i++) {
+        const t = a + ((b - a) * i) / n, y = sampleRow(k, t) + 0.1;
+        cpos.push(xOf(t), y + 0.022, z, xOf(t), y - 0.022, z);
+        if (y > top) top = y;
+        if (i < n) { const o = base + i * 2; cidx.push(o, o + 1, o + 2, o + 1, o + 3, o + 2); }
+      }
+      crit.push({ seg, d: b - a, p: new THREE.Vector3(xOf((a + b) / 2), top + 0.3, z) });
+    }
+    if (cidx.length) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(cpos), 3)); g.setIndex(cidx); g.computeVertexNormals();
+      ridges.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0xffffff, emissiveIntensity: 2.2, roughness: 1, side: THREE.DoubleSide })));
+    }
+
+    // the slice spans every row and the wall
+    const zFar = zWall - 0.4, zNear = D / 2 + 0.8, zLen = zNear - zFar, zMid = (zNear + zFar) / 2, SH = H + 0.9;
     floor.scale.set(W + 400, D + 400, 1); frost.scale.copy(floor.scale);
-    // one persistent buffer for the slice outline, so moving the slice only rewrites vertex positions
     const ribbonIdx = [];
-    for (let i = 0; i < R - 1; i++) { const a = i * 2; ribbonIdx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
-    ribbonGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(Math.max(2, R) * 6), 3));
+    for (let i = 0; i < R; i++) { const a = i * 2; ribbonIdx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    ribbonGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((R + 1) * 6), 3));
     ribbonGeo.deleteAttribute('normal');
     ribbonGeo.setIndex(ribbonIdx);
-    sheet.scale.set(D + 1.6, H + 0.9, 1); sheet.position.y = (H + 0.9) / 2;
-    blade.scale.set(0.035, 0.02, D + 1.6); blade.position.y = 0.012;
-    const SH = H + 0.9, SZ = D / 2 + 0.8;
-    frameTop.scale.set(0.02, 0.02, D + 1.6); frameTop.position.set(0, SH, 0);
-    frameA.scale.set(0.02, SH, 0.02); frameA.position.set(0, SH / 2, SZ);
-    frameB.scale.set(0.02, SH, 0.02); frameB.position.set(0, SH / 2, -SZ);
+    sheet.scale.set(zLen, SH, 1); sheet.position.set(0, SH / 2, zMid);
+    blade.scale.set(0.035, 0.02, zLen); blade.position.set(0, 0.012, zMid);
+    frameTop.scale.set(0.02, 0.02, zLen); frameTop.position.set(0, SH, zMid);
+    frameA.scale.set(0.02, SH, 0.02); frameA.position.set(0, SH / 2, zNear);
+    frameB.scale.set(0.02, SH, 0.02); frameB.position.set(0, SH / 2, zFar);
+
+    // labels: time ticks, row names, the wall, the core line, the longest critical links
     const step = niceStep((S.v1 - S.v0) / 8);
-    labelsEl.textContent = ''; tickLabels = []; rowLabels = [];
+    labelsEl.textContent = ''; tickLabels = []; rowLabels = []; fixedLabels = []; tagEls = [];
+    const label = (cls, text, chip) => {
+      const el = document.createElement('span'); el.className = cls;
+      if (chip) { const c = document.createElement('i'); c.style.background = chip; el.append(c); }
+      el.append(text); labelsEl.appendChild(el); return el;
+    };
     for (let v = Math.ceil(S.v0 / step - 1e-9) * step; v <= S.v1 + 1e-6; v += step) {
-      const m = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.004, D + 1.6), tickMat);
-      m.position.set(xOf(v), 0.003, 0); ticks.add(m);
-      const el = document.createElement('span'); el.className = 'tick'; el.textContent = tickLabel(v, step);
-      labelsEl.appendChild(el); tickLabels.push({ el, p: new THREE.Vector3(xOf(v), 0, D / 2 + 1.25) });
+      const m = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.004, zLen), tickMat);
+      m.position.set(xOf(v), 0.003, zMid); ticks.add(m);
+      tickLabels.push({ el: label('tick', tickLabel(v, step)), p: new THREE.Vector3(xOf(v), 0, D / 2 + 1.25) });
     }
-    S.rows.forEach((n, i) => {
-      const el = document.createElement('span'); el.className = 'rowl';
-      const chip = document.createElement('i'); chip.style.background = colorFor(n.name);
-      el.append(chip, n.name);
-      labelsEl.appendChild(el); rowLabels.push({ el, p: new THREE.Vector3(X0 - 0.35, 0.05, zOf(i)) });
-    });
-    setHover(S.hover);
+    S.rows3.forEach((n, k) => rowLabels.push({ el: label('rowl', n.name, colorFor(n.name)), p: new THREE.Vector3(X0 - 0.35, 0.05, zOf(k)) }));
+    fixedLabels.push({ el: label('rowl', 'busy, all rows', '#9aa9c2'), p: new THREE.Vector3(X0 - 0.35, 0.05, zWall), align: 'right' });
+    fixedLabels.push({ el: label('corel', S.cores + (S.cores === 1 ? ' core' : ' cores')), p: new THREE.Vector3(X0 + W + 0.45, coreY, zWall + 0.06), align: 'left' });
+    crit.sort((a, b) => b.d - a.d).slice(0, 3).forEach((c) => fixedLabels.push({ el: label('crit', shortLabel(c.seg.p) + ' · ' + fmtD(c.seg.end - c.seg.start)), p: c.p, align: 'center' }));
+    for (let i = 0; i < 3; i++) { const el = label('tag', ''); el.hidden = true; tagEls.push(el); }
+    setHover(S.hover >= 0 ? S.r3[S.hover] : -1);
     setCursor();
     if (!userMoved) resetView();
     sceneChanged();
   }
 
+  function updateArcs() {
+    const pa = arcGeo.getAttribute('position'), ca = arcGeo.getAttribute('color'), pos = pa.array, col = ca.array;
+    const t = S.t, w = (S.v1 - S.v0) * 0.04, lo = ub(S.starts, Math.max(S.v0, t - w)), hi = ub(S.starts, t);
+    let n = 0;
+    const perPair = new Map();
+    for (let i = hi - 1; i >= lo && n < ARC_MAX; i--) {
+      const p = S.procs[i];
+      if (p.parent < 0) continue;
+      const kc = S.row3Of.get(p.node), kp = S.row3Of.get(S.procs[p.parent].node);
+      if (kc === undefined || kp === undefined || kc === kp) continue;
+      const pair = kp * 4096 + kc, seen = perPair.get(pair) || 0;
+      if (seen >= 3) continue;
+      perPair.set(pair, seen + 1);
+      const x = xOf(p.start), ya = sampleRow(kp, p.start), yb = sampleRow(kc, p.start), za = zOf(kp), zb = zOf(kc);
+      const ym = Math.max(ya, yb) + 0.3 + 0.1 * Math.abs(kc - kp), zm = (za + zb) / 2;
+      const fade = 1 - (t - p.start) / w, c = colOf(p.prog), f = 0.9 * fade * fade;
+      let py = ya, pz = za;
+      for (let j = 1; j <= ARC_SEG; j++) {
+        const u = j / ARC_SEG, v = 1 - u, qy = v * v * ya + 2 * v * u * ym + u * u * yb, qz = v * v * za + 2 * v * u * zm + u * u * zb;
+        const o = (n * ARC_SEG + j - 1) * 6;
+        pos[o] = x; pos[o + 1] = py; pos[o + 2] = pz; pos[o + 3] = x; pos[o + 4] = qy; pos[o + 5] = qz;
+        col[o] = col[o + 3] = c.r * f; col[o + 1] = col[o + 4] = c.g * f; col[o + 2] = col[o + 5] = c.b * f;
+        py = qy; pz = qz;
+      }
+      n++;
+    }
+    arcGeo.setDrawRange(0, n * ARC_SEG * 2);
+    pa.needsUpdate = true; ca.needsUpdate = true;
+  }
+
   function setCursor() {
-    const R = S.rows.length, x = xOf(S.t);
-    slice.position.x = x;
+    const R = gl.length;
+    slice.position.x = xOf(S.t);
     const attr = ribbonGeo.getAttribute('position'), pos = attr.array;
-    for (let i = 0; i < R; i++) {
-      const y = sampleRow(i, S.t), z = zOf(i);
-      beads[i].position.set(0, y, z);
-      pos.set([0, y + 0.03, z, 0, y - 0.03, z], i * 6);
+    for (let k = 0; k <= R; k++) {
+      const y = k < R ? sampleRow(k, S.t) : heightAt(wallSeries, S.t), z = k < R ? zOf(k) : zWall;
+      beads[k].position.set(0, y, z);
+      pos.set([0, y + 0.03, z, 0, y - 0.03, z], k * 6);
     }
     attr.needsUpdate = true;
     ribbonGeo.computeVertexNormals();
+    updateArcs();
     touch();
   }
 
-  function setHover(i) {
-    for (let k = 0; k < bodies.length; k++) {
-      const hot = k === i, dim = i >= 0 && !hot;
-      bodies[k].material.emissiveIntensity = hot ? FILL * 1.9 : dim ? FILL * 0.55 : FILL;
-      crests[k].material.emissiveIntensity = hot ? 2.6 : dim ? 0.7 : 1.35;
-      rests[k].material.emissiveIntensity = hot ? 0.9 : 0.16;
-      if (rowLabels[k]) rowLabels[k].el.classList.toggle('hot', hot);
-    }
+  function setHover(k) {
+    gl.forEach((rec, i) => { rec.tone(i === k, k >= 0 && i !== k); if (rowLabels[i]) rowLabels[i].el.classList.toggle('hot', i === k); });
     rt.matDirty = true; touch();
+  }
+
+  function setTags(list) {
+    tags = list;
+    tagEls.forEach((el, i) => { const t = list[i]; el.hidden = !t; if (t && el.textContent !== t.text) el.textContent = t.text; });
+    touch();
   }
 
   // ---- render scheduling. With ray tracing on, the ridges and floor are path traced on the GPU and keep accumulating
@@ -861,8 +1040,8 @@ async function init3D() {
   function setLook(next) {
     if (look === next) return;
     look = next;
-    if (next === 'traced') { scene.remove(frost); scene.add(floor); overlayScene.add(slice); }
-    else { scene.remove(floor); scene.add(frost); scene.add(slice); }
+    if (next === 'traced') { scene.remove(frost); scene.add(floor); overlayScene.add(slice, arcs); }
+    else { scene.remove(floor); scene.add(frost); scene.add(slice, arcs); }
   }
   function touch() { needsRender = true; }
   function camChanged() { rt.camDirty = true; lastCam = performance.now(); needsRender = true; }
@@ -967,7 +1146,7 @@ async function init3D() {
     if (needsRender) rasterRender();
   }
 
-  const v3 = new THREE.Vector3();
+  const v3 = new THREE.Vector3(), v4 = new THREE.Vector3();
   function project(p) { v3.copy(p).project(camera); return v3.z > 1 || v3.z < -1 ? null : [(v3.x * 0.5 + 0.5) * stage.clientWidth, (-v3.y * 0.5 + 0.5) * stage.clientHeight]; }
   function placeLabels() {
     const w = stage.clientWidth, h = stage.clientHeight;
@@ -976,14 +1155,32 @@ async function init3D() {
       t.el.hidden = !ok; if (ok) t.el.style.transform = 'translate(' + q[0].toFixed(1) + 'px,' + q[1].toFixed(1) + 'px) translate(-50%,-50%)';
     }
     // Row names: the hovered row always shows; the rest show front to back wherever they do not collide.
-    const pts = rowLabels.map((r) => project(r.p)), taken = [];
+    const pts = rowLabels.map((r) => project(r.p)), taken = [], hot = S.hover >= 0 ? S.r3[S.hover] : -1;
     const fits = (q) => q && q[0] > 30 && q[0] < w && q[1] > 28 && q[1] < h - 4;
-    if (S.hover >= 0 && fits(pts[S.hover])) taken.push(pts[S.hover][1]);
+    if (hot >= 0 && fits(pts[hot])) taken.push(pts[hot][1]);
     rowLabels.forEach((r, i) => {
       const q = pts[i];
       let ok = fits(q);
-      if (ok && i !== S.hover) { ok = taken.every((y) => Math.abs(y - q[1]) >= 13); if (ok) taken.push(q[1]); }
+      if (ok && i !== hot) { ok = taken.every((y) => Math.abs(y - q[1]) >= 13); if (ok) taken.push(q[1]); }
       r.el.hidden = !ok; if (ok) r.el.style.transform = 'translate(' + q[0].toFixed(1) + 'px,' + q[1].toFixed(1) + 'px) translate(-100%,-50%)';
+    });
+    const ANCHOR = { right: '-100%,-50%', left: '0,-50%', center: '-50%,-100%' }, placed = [];
+    const clear = (q) => placed.every((o) => Math.abs(o[1] - q[1]) >= 17 || Math.abs(o[0] - q[0]) >= 150);
+    for (const f of fixedLabels) {
+      const q = project(f.p);
+      let ok = q && q[0] > 4 && q[0] < w - 4 && q[1] > 24 && q[1] < h - 4;
+      if (ok && f.align === 'right') ok = taken.every((y) => Math.abs(y - q[1]) >= 13);
+      if (ok && f.align === 'center') { ok = clear(q); if (ok) placed.push(q); }
+      f.el.hidden = !ok; if (ok) f.el.style.transform = 'translate(' + q[0].toFixed(1) + 'px,' + q[1].toFixed(1) + 'px) translate(' + ANCHOR[f.align] + ')';
+    }
+    // name tags ride above the beads where the slice meets each row
+    tags.forEach((t, i) => {
+      const el = tagEls[i];
+      if (!el || t.k >= gl.length) return;
+      v4.set(xOf(S.t), sampleRow(t.k, S.t) + 0.28, zOf(t.k));
+      const q = project(v4), ok = q && q[0] > 40 && q[0] < w - 40 && q[1] > 30 && q[1] < h - 8 && clear(q);
+      if (ok) placed.push(q);
+      el.hidden = !ok; if (ok) el.style.transform = 'translate(' + q[0].toFixed(1) + 'px,' + q[1].toFixed(1) + 'px) translate(-50%,-100%)';
     });
   }
 
@@ -1004,8 +1201,11 @@ async function init3D() {
     const r = canvas.getBoundingClientRect();
     ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
     ray.setFromCamera(ndc, camera);
-    const hit = ray.intersectObjects(bodies, false)[0];
-    if (hit) return { i: hit.object.userData.i, t: S.v0 + clamp((hit.point.x - X0) / W, 0, 1) * (S.v1 - S.v0) };
+    const hit = ray.intersectObjects(pickables, false)[0];
+    if (hit) {
+      const procs = hit.object.userData.procs;
+      return { i: hit.object.userData.k, proc: procs ? procs[Math.floor(hit.faceIndex / 12)] : null, t: S.v0 + clamp((hit.point.x - X0) / W, 0, 1) * (S.v1 - S.v0) };
+    }
     return ray.ray.intersectPlane(ground, hitV) && Math.abs(hitV.z) < D / 2 + 1.5 && hitV.x > X0 - 0.5 && hitV.x < X0 + W + 0.5 ? { i: -1, t: S.v0 + clamp((hitV.x - X0) / W, 0, 1) * (S.v1 - S.v0) } : null;
   }
   let down = null;
@@ -1013,12 +1213,13 @@ async function init3D() {
   canvas.addEventListener('pointermove', (e) => {
     if (e.buttons) return;
     const h = pick(e);
-    if (h && h.i >= 0) { api.onHover(h.i); showTip(nodeTip(S.rows[h.i], h.t), e.clientX, e.clientY); } else { api.onHover(-1); hideTip(); }
+    if (h && h.i >= 0) { api.onHover(S.rows.indexOf(S.rows3[h.i])); showTip(h.proc ? procTip(h.proc) : nodeTip(S.rows3[h.i], h.t), e.clientX, e.clientY); } else { api.onHover(-1); hideTip(); }
   });
   canvas.addEventListener('pointerup', (e) => { if (down && Math.hypot(e.clientX - down[0], e.clientY - down[1]) < 5) { const h = pick(e); if (h) api.onPick(h.t); } down = null; });
   canvas.addEventListener('pointerleave', () => { api.onHover(-1); hideTip(); });
+  canvas.addEventListener('dblclick', (e) => { const h = pick(e); if (h && h.i >= 0) api.onUnfold(S.rows3[h.i]); });
 
-  const api = { software, setRows, setCursor, setHover, setRT, resetView, touch, frame, onHover: () => {}, onPick: () => {}, debug: { rt, scene, camera, renderer } };
+  const api = { software, setRows, setCursor, setHover, setTags, setRT, resetView, touch, frame, onHover: () => {}, onPick: () => {}, onUnfold: () => {}, debug: { rt, scene, camera, renderer } };
   resize();
   setRows();
   return api;
@@ -1048,6 +1249,7 @@ function start() {
     if (!v) return;
     v.onHover = setHover;
     v.onPick = setT;
+    v.onUnfold = (n) => { if (S.unfolded.has(n.id)) S.unfolded.delete(n.id); else S.unfolded.add(n.id); S.hover = -1; rowsChanged(); };
     view3d = v;
     window.__wt = { S, view3d: v };
     let wantRT = !v.software && !window.matchMedia('(pointer: coarse)').matches;
