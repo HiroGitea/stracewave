@@ -494,9 +494,21 @@ function updateUI() {
 }
 
 // ---------------------------------------------------------------- sound
-// The heights the slice cuts through, row by row, become one cycle of an oscillator's waveform, so the timbre follows
-// which programs are running. Pitch and loudness follow how busy the machine is. It sounds while the slice moves.
-const audio = { ctx: null, osc: null, gain: null, on: false, moved: 0 };
+// A mixing desk driven by the trace. Every row shown in 3D is its own track:
+//  - a track holds one note of the A minor pentatonic scale (front rows low, back rows high), so any combination of
+//    tracks is consonant. Its timbre is picked by program name, and it sits at its own place between left and right;
+//  - a track's volume is the height of its ridge where the slice cuts it, so the mix is the slice. Soloing or muting
+//    a row does the same to its track, and pointing at a row brings its track forward;
+//  - a bass note under everything follows how busy the machine is and walks through A, F, C, G along the timeline;
+//  - a process that starts on a different row from its parent rings a bell on that row's note, an octave up. At most
+//    about six a second, the longest-lived process winning;
+//  - everything goes through a reverb, and the bells through an echo. It sounds while the slice moves and rings out
+//    when it stops.
+const SCALE = [45, 48, 50, 52, 55, 57, 60, 62, 64, 67, 69, 72, 74, 76, 79];   // MIDI notes, A2 to G5
+const BASS = [33, 29, 36, 31];                                                // A1, F1, C2, G1
+const MAX_TRACKS = 32;
+const hz = (midi) => 440 * Math.pow(2, (midi - 69) / 12);
+const audio = { ctx: null, on: false, moved: 0, lastT: 0, lastPluck: 0, tracks: [], rowsRef: null, timbres: [], bass: [], bassGain: null, bus: null, filter: null, out: null, master: null, wet: null, echo: null, analyser: null };
 function levelAt(n, t) {
   const s = seriesOf(n, BINS_3D), f = clamp(((t - S.v0) / (S.v1 - S.v0)) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
   return s[a] + (s[b] - s[a]) * (f - a);
@@ -506,42 +518,111 @@ function setSound(on) {
   if (on && !audio.ctx) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) { $('#sound').checked = false; audio.on = false; toast('This browser has no Web Audio.'); return; }
-    audio.ctx = new Ctx();
-    audio.osc = audio.ctx.createOscillator();
-    const filter = audio.ctx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 2200;
-    audio.gain = audio.ctx.createGain(); audio.gain.gain.value = 0;
-    audio.osc.connect(filter).connect(audio.gain).connect(audio.ctx.destination);
-    audio.osc.start();
+    const ctx = audio.ctx = new Ctx();
+    const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -16; comp.ratio.value = 4;
+    audio.analyser = ctx.createAnalyser(); audio.analyser.fftSize = 2048;
+    audio.master = ctx.createGain(); audio.master.gain.value = 0.9;
+    audio.master.connect(comp).connect(audio.analyser).connect(ctx.destination);
+    // reverb from a generated impulse: stereo noise that dies away over 2.6 seconds
+    const conv = ctx.createConvolver(), len = Math.floor(ctx.sampleRate * 2.6), ir = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.6); }
+    conv.buffer = ir;
+    audio.wet = ctx.createGain();
+    const wetOut = ctx.createGain(); wetOut.gain.value = 0.3;
+    audio.wet.connect(conv).connect(wetOut).connect(audio.master);
+    // echo for the bells: a filtered delay that feeds back into itself
+    audio.echo = ctx.createDelay(1); audio.echo.delayTime.value = 0.33;
+    const fb = ctx.createGain(); fb.gain.value = 0.38;
+    const damp = ctx.createBiquadFilter(); damp.type = 'lowpass'; damp.frequency.value = 1800;
+    const echoOut = ctx.createGain(); echoOut.gain.value = 0.45;
+    audio.echo.connect(damp).connect(fb).connect(audio.echo);
+    damp.connect(echoOut).connect(audio.master); echoOut.connect(audio.wet);
+    // tracks and bass share one low-pass filter and one output fader
+    audio.bus = ctx.createGain();
+    audio.filter = ctx.createBiquadFilter(); audio.filter.type = 'lowpass'; audio.filter.frequency.value = 700; audio.filter.Q.value = 0.5;
+    audio.out = ctx.createGain(); audio.out.gain.value = 0;
+    audio.bus.connect(audio.filter).connect(audio.out); audio.out.connect(audio.master); audio.out.connect(audio.wet);
+    // three timbres, from round to slightly hollow to slightly bright; all soft
+    const wave = (partials) => ctx.createPeriodicWave(new Float32Array(partials.length + 1), Float32Array.from([0, ...partials]));
+    audio.timbres = [wave([1, 0.25, 0.08]), wave([1, 0, 0.33, 0, 0.12, 0, 0.05]), wave([1, 0.5, 0.18, 0.3, 0.05, 0.1])];
+    audio.bassGain = ctx.createGain(); audio.bassGain.gain.value = 0; audio.bassGain.connect(audio.bus);
+    for (const [type, oct, amp] of [['sine', 1, 0.5], ['triangle', 2, 0.22]]) {
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.type = type; osc.frequency.value = hz(BASS[0]) * oct; g.gain.value = amp;
+      osc.connect(g).connect(audio.bassGain); osc.start();
+      audio.bass.push({ osc, oct });
+    }
   }
-  if (audio.ctx) { if (on) audio.ctx.resume(); else audio.gain.gain.setTargetAtTime(0, audio.ctx.currentTime, 0.05); }
+  if (audio.ctx) { if (on) audio.ctx.resume(); else audio.out.gain.setTargetAtTime(0, audio.ctx.currentTime, 0.1); }
+}
+// One oscillator per row shown in 3D. Rebuilt whenever that set of rows changes.
+function buildTracks() {
+  const ctx = audio.ctx, rows = S.rows3.slice(0, MAX_TRACKS), R = rows.length;
+  for (const t of audio.tracks) { t.osc.stop(); t.last.disconnect(); }
+  audio.tracks = rows.map((n, k) => {
+    const osc = ctx.createOscillator(), gain = ctx.createGain();
+    const note = SCALE[Math.round((k / Math.max(1, R - 1)) * (SCALE.length - 1))];
+    let h = 0; for (const ch of n.name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    osc.setPeriodicWave(audio.timbres[h % audio.timbres.length]);
+    osc.frequency.value = hz(note); osc.detune.value = ((k * 7) % 11) - 5;      // a few cents apart, so shared notes shimmer instead of phasing
+    gain.gain.value = 0;
+    osc.connect(gain);
+    let last = gain;
+    if (ctx.createStereoPanner) { last = ctx.createStereoPanner(); last.pan.value = R > 1 ? (k / (R - 1)) * 1.3 - 0.65 : 0; gain.connect(last); }
+    last.connect(audio.bus); osc.start();
+    return { osc, gain, last, node: n, note };
+  });
+  audio.rowsRef = S.rows3;
+}
+// A soft bell: a sine with quieter partials above it that fade faster, panned, with reverb and echo.
+function pluck(midi, level, pan) {
+  const ctx = audio.ctx, at = ctx.currentTime, g = ctx.createGain();
+  for (const [mult, amp, decay] of [[1, 1, 0.9], [2, 0.28, 0.35], [3, 0.08, 0.2]]) {
+    const osc = ctx.createOscillator(), e = ctx.createGain();
+    osc.frequency.value = hz(midi) * mult;
+    e.gain.setValueAtTime(0, at); e.gain.linearRampToValueAtTime(level * amp, at + 0.008); e.gain.exponentialRampToValueAtTime(0.0001, at + decay);
+    osc.connect(e).connect(g); osc.start(at); osc.stop(at + decay + 0.05);
+  }
+  let out = g;
+  if (ctx.createStereoPanner) { out = ctx.createStereoPanner(); out.pan.value = pan; g.connect(out); }
+  out.connect(audio.master); out.connect(audio.wet); out.connect(audio.echo);
 }
 function updateSound(now) {
   if (!audio.on || !audio.ctx) return;
-  const at = audio.ctx.currentTime, rows = S.rows3, N = 128, K = 32;
-  const sounding = (S.playing || now - audio.moved < 250) && rows.length > 0;
-  const busy = levelAt(S.busy, S.t) / Math.max(1, S.cores);
-  let energy = 0;
+  const ctx = audio.ctx, at = ctx.currentTime, where = (S.t - S.v0) / (S.v1 - S.v0);
+  if (audio.rowsRef !== S.rows3) buildTracks();
+  const tracks = audio.tracks, R = tracks.length, hot = S.hover >= 0 ? S.r3[S.hover] : -1;
+  const sounding = S.playing || now - audio.moved < 250;
+  const busy = clamp(levelAt(S.busy, S.t) / Math.max(1, S.cores), 0, 1);
+  // the mix: each track as loud as its ridge is tall at the slice; the pointed-at track comes forward
+  const unit = 0.3 / Math.sqrt(Math.max(1, R));
+  tracks.forEach((t, k) => {
+    const lift = hot < 0 ? 1 : k === hot ? 2 : 0.45;
+    t.gain.gain.setTargetAtTime(unit * Math.pow(hOf(levelAt(t.node, S.t)), 1.3) * lift, at, 0.07);
+  });
+  const root = BASS[Math.min(7, Math.floor(where * 8)) % 4];
+  for (const b of audio.bass) b.osc.frequency.setTargetAtTime(hz(root) * b.oct, at, 0.1);
+  audio.bassGain.gain.setTargetAtTime(0.1 + 0.2 * busy, at, 0.15);
+  audio.filter.frequency.setTargetAtTime(500 + 3000 * Math.pow(busy, 0.8), at, 0.12);
   if (sounding) {
-    // half a cycle walks across the rows, the other half is its negative mirror, so the cycle has no DC offset
-    const half = new Float32Array(N / 2);
-    for (let i = 0; i < N / 2; i++) {
-      const f = (i / (N / 2 - 1)) * (rows.length - 1), a = Math.floor(f), b = Math.min(rows.length - 1, a + 1);
-      const ha = hOf(levelAt(rows[a], S.t)), hb = hOf(levelAt(rows[b], S.t));
-      half[i] = (ha + (hb - ha) * (f - a)) * Math.sin((Math.PI * i) / (N / 2 - 1));
-      energy += half[i] * half[i];
-    }
-    if (energy > 1e-4) {
-      const real = new Float32Array(K + 1), imag = new Float32Array(K + 1);
-      for (let k = 1; k <= K; k++) {
-        let re = 0, im = 0;
-        for (let i = 0; i < N; i++) { const x = i < N / 2 ? half[i] : -half[N - 1 - i], ph = (2 * Math.PI * k * i) / N; re += x * Math.cos(ph); im += x * Math.sin(ph); }
-        real[k] = (2 * re) / N; imag[k] = (2 * im) / N;
+    // bells: of the processes started since the last update, the longest-lived one that landed on another row
+    const from = audio.lastT, to = S.t;
+    if (to > from && to - from < (S.v1 - S.v0) * 0.05 && R && now - audio.lastPluck >= 150) {
+      let best = null;
+      for (let i = ub(S.starts, from), end = ub(S.starts, to); i < end; i++) {
+        const p = S.procs[i];
+        if (p.parent < 0) continue;
+        const kc = S.row3Of.get(p.node), kp = S.row3Of.get(S.procs[p.parent].node);
+        if (kc !== undefined && kc !== kp && kc < R && (!best || p.end - p.start > best[0])) best = [p.end - p.start, kc];
       }
-      audio.osc.setPeriodicWave(audio.ctx.createPeriodicWave(real, imag));
-      audio.osc.frequency.setTargetAtTime(55 * Math.pow(2, clamp(busy, 0, 2)), at, 0.06);
+      if (best) {
+        audio.lastPluck = now;
+        pluck(tracks[best[1]].note + 12, 0.05 + 0.05 * clamp(Math.log10(1 + best[0]) / 2, 0, 1), clamp(where * 1.4 - 0.7, -0.7, 0.7));
+      }
     }
   }
-  audio.gain.gain.setTargetAtTime(sounding && energy > 1e-4 ? 0.1 * clamp(0.3 + busy, 0.3, 1) : 0, at, 0.07);
+  audio.lastT = S.t;
+  audio.out.gain.setTargetAtTime(sounding ? 1 : 0, at, sounding ? 0.12 : 0.35);
 }
 
 // ---------------------------------------------------------------- shared interactions
@@ -656,7 +737,11 @@ $('#logFile').addEventListener('change', (e) => { const f = e.target.files[0]; i
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer && e.dataTransfer.files[0]; if (f) openFile(f); });
 $('#resetView').addEventListener('click', () => { if (view3d) view3d.resetView(); });
-$('#rt').addEventListener('change', (e) => { if (view3d) view3d.setRT(e.target.checked); else e.target.checked = false; });
+$('#rt').addEventListener('change', (e) => {
+  if (!view3d) { e.target.checked = false; return; }
+  try { localStorage.setItem('stracewave.raytracing', e.target.checked ? '1' : '0'); } catch (err) { /* storage is optional */ }
+  view3d.setRT(e.target.checked);
+});
 $('#glass').addEventListener('change', (e) => {
   try { localStorage.setItem('stracewave.glass', e.target.checked ? '1' : '0'); } catch (err) { /* storage is optional */ }
   if (view3d) view3d.setGlass(e.target.checked);
@@ -797,7 +882,12 @@ async function init3D() {
   const veilMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.4, depthWrite: false, blending: THREE.CustomBlending,
     blendSrc: THREE.ZeroFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor });
   const WHITE = new THREE.Color(0xffffff);
-  let glass = true;
+  let glass = true, hoverK = -1;
+  // Hover highlight for the ray-traced picture. It is drawn in the overlay, on top of the traced image, so pointing
+  // at a row never restarts the path tracer. The raster renderer brightens and dims the materials themselves.
+  const hlMat = (opacity) => new THREE.MeshBasicMaterial({ transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+  const hlFill = new THREE.Mesh(new THREE.BufferGeometry(), hlMat(0.2)), hlEdge = new THREE.Mesh(new THREE.BufferGeometry(), hlMat(0.9));
+  for (const m of [hlFill, hlEdge]) { m.renderOrder = 5; m.visible = false; m.frustumCulled = false; overlayScene.add(m); }
   overlayScene.add(occluders);
   const wall = new THREE.Group(); scene.add(wall);
   // per-row state, indexed like S.rows3
@@ -1106,8 +1196,16 @@ async function init3D() {
   }
 
   function setHover(k) {
-    gl.forEach((rec, i) => { rec.tone(i === k, k >= 0 && i !== k); if (rowLabels[i]) rowLabels[i].el.classList.toggle('hot', i === k); });
-    rt.matDirty = true; touch();
+    hoverK = k;
+    const traced = look === 'traced', rec = k >= 0 ? gl[k] : null;
+    gl.forEach((r, i) => { r.tone(!traced && i === k, !traced && k >= 0 && i !== k); if (rowLabels[i]) rowLabels[i].el.classList.toggle('hot', i === k); });
+    hlFill.visible = hlEdge.visible = false;
+    if (traced && rec && rec.solids.length) {
+      const col = colOf(rec.node.name);
+      hlFill.geometry = rec.solids[0].geometry; hlFill.material.color.copy(col); hlFill.position.z = zOf(k); hlFill.visible = true;
+      if (!rec.laneH) { hlEdge.geometry = rec.meshes[1].geometry; hlEdge.material.color.copy(col).lerp(WHITE, 0.45); hlEdge.position.z = zOf(k); hlEdge.visible = true; }
+    }
+    touch();
   }
 
   function setTags(list) {
@@ -1134,6 +1232,7 @@ async function init3D() {
     if (next === 'traced') { scene.remove(frost); scene.add(floor); overlayScene.add(slice, arcs); }
     else { scene.remove(floor); scene.add(frost); scene.add(slice, arcs); }
     applyLook();
+    setHover(hoverK);
   }
   function touch() { needsRender = true; }
   function camChanged() { rt.camDirty = true; lastCam = performance.now(); needsRender = true; }
@@ -1143,7 +1242,6 @@ async function init3D() {
 
   async function setRT(on) {
     rt.on = on; needsRender = true;
-    try { localStorage.setItem('stracewave.rt', on ? '1' : '0'); } catch (err) { /* storage is optional */ }
     if (!on) { setBadge(''); return; }
     if (rt.pt || rt.loading) return;
     rt.loading = true; setBadge('ray tracing · loading');
@@ -1447,8 +1545,9 @@ function start() {
     v.onUnfold = (n) => { if (S.unfolded.has(n.id)) S.unfolded.delete(n.id); else S.unfolded.add(n.id); S.hover = -1; rowsChanged(); };
     view3d = v;
     window.__wt = { S, view3d: v, audio };
-    let wantRT = !v.software && !window.matchMedia('(pointer: coarse)').matches;
-    try { const saved = localStorage.getItem('stracewave.rt'); if (saved !== null) wantRT = saved === '1'; } catch (err) { /* storage is optional */ }
+    // ray tracing is opt-in; the choice is remembered once the viewer has made one
+    let wantRT = false;
+    try { wantRT = !v.software && localStorage.getItem('stracewave.raytracing') === '1'; } catch (err) { /* storage is optional */ }
     $('#rt').checked = wantRT;
     if (wantRT) v.setRT(true);
     let wantGlass = true;
