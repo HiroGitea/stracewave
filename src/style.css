@@ -91,6 +91,7 @@ button { cursor: pointer; }
 .cores input { width: 4.4em; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font-family: var(--font-mono); font-size: 12px; }
 .zoom-reset { background: none; border: 1px solid var(--accent); border-radius: 999px; color: var(--accent); font-family: var(--font-mono); font-size: 11px; letter-spacing: 0; text-transform: none; padding: 1px 8px; white-space: pre; }
 .ghost { background: none; border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; font-size: 13px; color: var(--ink-2); }
+.ghost.live { color: #fff; border-color: var(--failed); background: rgba(208, 59, 59, 0.25); }
 .ghost:hover { color: var(--ink); border-color: var(--ink-3); }
 
 .tl { padding: 12px 14px 12px; font-family: var(--font-mono); font-size: 12.5px; }

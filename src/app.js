@@ -508,7 +508,7 @@ const SCALE = [45, 48, 50, 52, 55, 57, 60, 62, 64, 67, 69, 72, 74, 76, 79];   //
 const BASS = [33, 29, 36, 31];                                                // A1, F1, C2, G1
 const MAX_TRACKS = 32;
 const hz = (midi) => 440 * Math.pow(2, (midi - 69) / 12);
-const audio = { ctx: null, on: false, moved: 0, lastT: 0, lastPluck: 0, tracks: [], rowsRef: null, timbres: [], bass: [], bassGain: null, bus: null, filter: null, out: null, master: null, wet: null, echo: null, analyser: null };
+const audio = { dest: null, ctx: null, on: false, moved: 0, lastT: 0, lastPluck: 0, tracks: [], rowsRef: null, timbres: [], bass: [], bassGain: null, bus: null, filter: null, out: null, master: null, wet: null, echo: null, analyser: null };
 function levelAt(n, t) {
   const s = seriesOf(n, BINS_3D), f = clamp(((t - S.v0) / (S.v1 - S.v0)) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
   return s[a] + (s[b] - s[a]) * (f - a);
@@ -623,6 +623,103 @@ function updateSound(now) {
   }
   audio.lastT = S.t;
   audio.out.gain.setTargetAtTime(sounding ? 1 : 0, at, sounding ? 0.12 : 0.35);
+}
+
+// ---------------------------------------------------------------- video export
+// Recording plays the visible range from its start and captures it, sound included, in real time. The picture is
+// composed on a canvas of its own each frame: the 3D view with its labels, then the timeline with its row names.
+const rec = { active: false, canvas: document.createElement('canvas'), g: null, recorder: null, chunks: [], mime: '', ending: 0, last: null, lay: null };
+const REC_W = 1920, REC_PAD = 36, REC_HEAD = 92, REC_FOOT = 64;
+const FONT_UI = '"Space Grotesk", system-ui, sans-serif', FONT_MONO = '"JetBrains Mono", ui-monospace, monospace';
+
+function startRecording() {
+  if (!window.MediaRecorder || !rec.canvas.captureStream) { toast('This browser cannot record video.', 4000); return; }
+  if (!view3d) { toast('The 3D view is not ready yet.'); return; }
+  if (!audio.on) { $('#sound').checked = true; setSound(true); }
+  if (!audio.ctx) { toast('Sound is not available, so there is nothing to record with the picture.', 4000); return; }
+  if (!audio.dest) { audio.dest = audio.ctx.createMediaStreamDestination(); audio.analyser.connect(audio.dest); }
+  // fix the layout for the whole take
+  const stage = $('#stage'), labelsW = tlLabels.clientWidth, barsW = tlCanvas.clientWidth, gap = 10;
+  const h3 = Math.round((REC_W * stage.clientHeight) / stage.clientWidth), ft = (REC_W - 2 * REC_PAD) / (labelsW + gap + barsW);
+  const tlH = Math.round((TOP + S.rows.length * ROW_H) * ft);
+  rec.lay = { h3, ft, tlH, tlY: REC_HEAD + h3 + 20, barsX: REC_PAD + (labelsW + gap) * ft, barsW: barsW * ft };
+  rec.canvas.width = REC_W; rec.canvas.height = Math.ceil((rec.lay.tlY + tlH + REC_FOOT) / 2) * 2;
+  rec.g = rec.canvas.getContext('2d');
+  const stream = rec.canvas.captureStream(30);
+  for (const track of audio.dest.stream.getAudioTracks()) stream.addTrack(track);
+  rec.mime = ['video/mp4;codecs=avc1.640033,mp4a.40.2', 'video/mp4;codecs=avc1.640033,opus', 'video/webm;codecs=vp9,opus', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) || '';
+  rec.chunks = [];
+  rec.recorder = new MediaRecorder(stream, { mimeType: rec.mime || undefined, videoBitsPerSecond: 16e6, audioBitsPerSecond: 192e3 });
+  rec.recorder.ondataavailable = (e) => { if (e.data.size) rec.chunks.push(e.data); };
+  rec.recorder.onstop = saveRecording;
+  S.playing = false; setT(S.v0); syncPlay();
+  rec.active = true; rec.ending = 0;
+  composeFrame();
+  rec.recorder.start(1000);
+  setTimeout(() => { if (rec.active) { S.playing = true; syncPlay(); } }, 500);      // half a second of still picture first
+  syncRecord();
+}
+function stopRecording() {
+  if (!rec.active) return;
+  rec.active = false; S.playing = false; syncPlay();
+  if (rec.recorder.state !== 'inactive') rec.recorder.stop();
+  syncRecord();
+}
+function saveRecording() {
+  const ext = rec.mime.includes('mp4') ? 'mp4' : 'webm';
+  rec.last = new Blob(rec.chunks, { type: rec.mime.split(';')[0] || 'video/webm' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(rec.last); a.download = 'stracewave-' + (S.key === 'file' ? 'trace' : S.key) + '.' + ext;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  toast('Saved ' + a.download + ' (' + (rec.last.size / 1e6).toFixed(1) + ' MB)', 5000);
+}
+function syncRecord() { const b = $('#record'); b.textContent = rec.active ? '■ Stop recording' : 'Record video'; b.classList.toggle('live', rec.active); }
+
+function composeFrame() {
+  const g = rec.g, L = rec.lay, W = rec.canvas.width, Ht = rec.canvas.height, glc = $('#gl'), stage = $('#stage');
+  g.fillStyle = '#0d1117'; g.fillRect(0, 0, W, Ht);
+  g.textBaseline = 'middle'; g.textAlign = 'left';
+  // header: name, what was traced, where the slice is
+  g.fillStyle = '#e6ebf4'; g.font = '600 34px ' + FONT_UI; g.fillText('stracewave', REC_PAD, 36);
+  g.fillStyle = '#6f7b90'; g.font = '18px ' + FONT_MONO; g.fillText($('#meta').innerText.replace(' · approximate tree', ''), REC_PAD, 70);
+  g.textAlign = 'right'; g.fillStyle = '#e6ebf4'; g.font = '34px ' + FONT_MONO; g.fillText(fmtT(S.t), W - REC_PAD, 40);
+  g.fillStyle = '#6f7b90'; g.font = '18px ' + FONT_MONO; g.fillText('of ' + fmtT(S.span), W - REC_PAD, 72);
+  g.textAlign = 'left';
+  // 3D view and the labels that float over it
+  g.drawImage(glc, 0, REC_HEAD, W, L.h3);
+  const sr = stage.getBoundingClientRect(), k = W / sr.width, COLORS = { tick: '#6f7b90', rowl: '#aab4c5', corel: '#8fd3ff', crit: '#ffffff', tag: '#e6ebf4' };
+  g.font = Math.round(11 * k) + 'px ' + FONT_MONO;
+  for (const el of $('#glLabels').children) {
+    if (el.hidden) continue;
+    const r = el.getBoundingClientRect(), cls = el.className.split(' ')[0];
+    let x = (r.left - sr.left) * k; const y = REC_HEAD + (r.top - sr.top + r.height / 2) * k;
+    if (y < REC_HEAD + 8 || y > REC_HEAD + L.h3 - 8) continue;
+    if (cls === 'tag') { g.fillStyle = 'rgba(8,11,16,0.8)'; g.fillRect(x, y - r.height * k / 2, r.width * k, r.height * k); x += 5 * k; }
+    const chip = el.firstElementChild;
+    if (chip) { g.fillStyle = chip.style.background; g.fillRect(x, y - 3.5 * k, 7 * k, 7 * k); x += 12 * k; }
+    g.fillStyle = el.classList.contains('hot') ? '#e6ebf4' : COLORS[cls] || '#aab4c5';
+    g.fillText(el.textContent, x, y);
+  }
+  // timeline: bars from its own canvas, row names redrawn beside them
+  const ft = L.ft, y0 = L.tlY;
+  g.drawImage(tlCanvas, L.barsX, y0, L.barsW, L.tlH);
+  g.fillStyle = '#6f7b90'; g.font = '500 ' + Math.round(11 * ft) + 'px ' + FONT_UI; g.fillText('TIMELINE', REC_PAD, y0 + (TOP - 14) * ft);
+  g.font = Math.round(12.5 * ft) + 'px ' + FONT_MONO;
+  const ST = { done: '#0ca30c', running: '#fab219', idle: 'rgba(250,178,25,0.45)', waiting: '#6f7b90' };
+  S.rows.forEach((n, i) => {
+    const y = y0 + (TOP + i * ROW_H + ROW_H / 2) * ft, st = rowParts[i].st;
+    let x = REC_PAD + 2 * ft;
+    g.globalAlpha = S.r3[i] < 0 ? 0.42 : 1;
+    g.fillStyle = ST[st.dataset.st] || '#6f7b90'; g.fillText(st.textContent, x, y);
+    x += (18 + n.vdepth * 14 + 16) * ft;
+    g.fillStyle = colorFor(n.name); g.fillRect(x, y - 4 * ft, 8 * ft, 8 * ft); x += 14 * ft;
+    g.fillStyle = '#aab4c5'; g.fillText(n.name, x, y); x += g.measureText(n.name).width + 6 * ft;
+    g.fillStyle = '#6f7b90'; g.fillText('(' + n.procs.length.toLocaleString() + (n.procs.length === 1 ? ' unit)' : ' units)'), x, y);
+    g.globalAlpha = 1;
+  });
+  g.fillStyle = '#aab4c5'; g.font = Math.round(12.5 * ft) + 'px ' + FONT_MONO;
+  g.fillText($('#tlFoot').innerText.replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ').replace(/ (✓|►|·|×) /g, '     $1 '), REC_PAD, y0 + L.tlH + REC_FOOT / 2);
 }
 
 // ---------------------------------------------------------------- shared interactions
@@ -747,6 +844,7 @@ $('#glass').addEventListener('change', (e) => {
   if (view3d) view3d.setGlass(e.target.checked);
 });
 $('#sound').addEventListener('change', (e) => setSound(e.target.checked));
+$('#record').addEventListener('click', () => (rec.active ? stopRecording() : startRecording()));
 $('#sliceList').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   const p = S.procs[+b.dataset.p], text = (p.cmd || p.prog) + '\n' + fmtD(p.end - p.start);
@@ -1525,10 +1623,16 @@ function frame(now) {
     setT(S.t + dt * ((S.v1 - S.v0) / PLAY_SECONDS) * S.speed);
     if (S.t >= S.v1) { S.playing = false; syncPlay(); }
   }
+  if (rec.active) {
+    // stop a little after the slice reaches the end, so the reverb can ring out; keep the 3D view redrawing meanwhile
+    if (!S.playing && S.t >= S.v1 - 1e-6) { if (!rec.ending) rec.ending = now; else if (now - rec.ending > 2000) stopRecording(); }
+    if (view3d) view3d.touch();
+  }
   if (dirty.tl) { drawTimeline(); dirty.tl = false; }
   if (dirty.ui && now - lastUI > 90) { updateUI(); dirty.ui = false; lastUI = now; }
   if (audio.on && now - lastSound > 80) { updateSound(now); lastSound = now; }
   if (view3d) view3d.frame(now);
+  if (rec.active) composeFrame();
   requestAnimationFrame(frame);
 }
 
@@ -1544,7 +1648,7 @@ function start() {
     v.onPick = setT;
     v.onUnfold = (n) => { if (S.unfolded.has(n.id)) S.unfolded.delete(n.id); else S.unfolded.add(n.id); S.hover = -1; rowsChanged(); };
     view3d = v;
-    window.__wt = { S, view3d: v, audio };
+    window.__wt = { S, view3d: v, audio, rec };
     // ray tracing is opt-in; the choice is remembered once the viewer has made one
     let wantRT = false;
     try { wantRT = !v.software && localStorage.getItem('stracewave.raytracing') === '1'; } catch (err) { /* storage is optional */ }
