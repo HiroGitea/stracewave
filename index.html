@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>stracewave</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;600&display=swap">
+<link rel="stylesheet" href="src/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/",
+    "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/",
+    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.4/build/index.module.js",
+    "three-gpu-pathtracer": "https://cdn.jsdelivr.net/npm/three-gpu-pathtracer@0.0.23/build/index.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>stracewave</h1>
+      <p class="meta" id="meta"></p>
+    </div>
+    <div class="actions">
+      <div class="seg" role="group" aria-label="Example trace" id="datasets"></div>
+      <button type="button" class="ghost" id="openLog">Open strace log…</button>
+      <input type="file" id="logFile" aria-label="strace log file" hidden>
+    </div>
+  </header>
+
+  <section class="panel" aria-label="Wavetable view">
+    <div class="stage-row">
+      <div class="stage" id="stage">
+        <canvas id="gl" aria-label="3D wavetable of running processes over time"></canvas>
+        <div class="gl-labels" id="glLabels"></div>
+        <div class="stage-note">height = processes running (√ scale) · drag to orbit · click to move the slice</div>
+        <div class="stage-badge" id="rtState" hidden></div>
+        <div class="stage-msg" id="glMsg" hidden></div>
+      </div>
+      <aside class="slice" aria-label="Processes alive at the slice">
+        <h2>Slice</h2>
+        <div class="slice-time"><span id="sliceT">0.0 s</span><small id="sliceN"></small></div>
+        <ul class="slice-list" id="sliceList"></ul>
+        <div class="slice-more" id="sliceMore"></div>
+      </aside>
+    </div>
+
+    <div class="transport">
+      <button type="button" class="play" id="play" aria-label="Play">▶</button>
+      <div class="seg" role="group" aria-label="Playback speed" id="speeds">
+        <button type="button" data-speed="1" aria-pressed="true">1×</button>
+        <button type="button" data-speed="3" aria-pressed="false">3×</button>
+        <button type="button" data-speed="8" aria-pressed="false">8×</button>
+      </div>
+      <input class="scrub" id="scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="Slice position">
+      <span class="clock"><b id="clockT">0.0 s</b> / <span id="clockEnd">0.0 s</span></span>
+      <label class="switch"><input type="checkbox" id="rt"> Ray tracing</label>
+      <button type="button" class="ghost" id="resetView">Reset view</button>
+    </div>
+
+    <div class="tl">
+      <div class="tl-body">
+        <div class="tl-labels" id="tlLabels"></div>
+        <canvas id="tlCanvas" aria-label="Process tree timeline"></canvas>
+      </div>
+      <div class="tl-foot" id="tlFoot"></div>
+    </div>
+  </section>
+
+  <ul class="guide">
+    <li><b>Ridges</b>: one per row of the process tree. Height is how many of that row's processes are running at that moment.</li>
+    <li><b>Light sheet</b>: the time slice. Press play, drag the bars below, or click the 3D view to move it.</li>
+    <li><b>Process tree</b>: siblings that run the same program share a row. Open a row to see its children; the ridges follow.</li>
+    <li><b>Bar colors</b>: green has finished, yellow is running now, dots have not started. The panel on the right lists what the slice cuts through.</li>
+  </ul>
+</div>
+<div class="tip" id="tip" hidden></div>
+<div class="toast" id="toast" hidden></div>
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
