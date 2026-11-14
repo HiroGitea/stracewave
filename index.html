@@ -39,6 +39,7 @@
         <div class="gl-labels" id="glLabels"></div>
         <div class="stage-note">height = processes running (√ scale) · drag to orbit · click to move the slice</div>
         <div class="stage-badge" id="rtState" hidden></div>
+        <div class="stage-gpu" id="gpuInfo" hidden></div>
         <div class="stage-msg" id="glMsg" hidden></div>
       </div>
       <aside class="slice" aria-label="Processes alive at the slice">
@@ -70,13 +71,6 @@
       <div class="tl-foot" id="tlFoot"></div>
     </div>
   </section>
-
-  <ul class="guide">
-    <li><b>Ridges</b>: one per row of the process tree. Height is how many of that row's processes are running at that moment.</li>
-    <li><b>Light sheet</b>: the time slice. Press play, drag the bars below, or click the 3D view to move it.</li>
-    <li><b>Process tree</b>: siblings that run the same program share a row. Open a row to see its children; the ridges follow.</li>
-    <li><b>Bar colors</b>: green has finished, yellow is running now, dots have not started. The panel on the right lists what the slice cuts through.</li>
-  </ul>
 </div>
 <div class="tip" id="tip" hidden></div>
 <div class="toast" id="toast" hidden></div>

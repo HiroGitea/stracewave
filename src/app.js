@@ -397,18 +397,28 @@ new ResizeObserver(() => sizeTimeline()).observe(tlCanvas.parentElement);
 async function init3D() {
   const stage = $('#stage'), canvas = $('#gl'), labelsEl = $('#glLabels'), msg = $('#glMsg'), badge = $('#rtState');
   const fail = (text) => { msg.textContent = text; msg.hidden = false; canvas.hidden = true; $('#rt').disabled = true; return null; };
-  let THREE, OrbitControls, EffectComposer, RenderPass, UnrealBloomPass, OutputPass;
+  let THREE, OrbitControls, EffectComposer, RenderPass, UnrealBloomPass, OutputPass, Reflector;
   try {
     const m = await Promise.all([
       import('three'), import('three/addons/controls/OrbitControls.js'), import('three/addons/postprocessing/EffectComposer.js'),
       import('three/addons/postprocessing/RenderPass.js'), import('three/addons/postprocessing/UnrealBloomPass.js'), import('three/addons/postprocessing/OutputPass.js'),
+      import('three/addons/objects/Reflector.js'),
     ]);
-    THREE = m[0]; OrbitControls = m[1].OrbitControls; EffectComposer = m[2].EffectComposer; RenderPass = m[3].RenderPass; UnrealBloomPass = m[4].UnrealBloomPass; OutputPass = m[5].OutputPass;
+    THREE = m[0]; OrbitControls = m[1].OrbitControls; EffectComposer = m[2].EffectComposer; RenderPass = m[3].RenderPass; UnrealBloomPass = m[4].UnrealBloomPass; OutputPass = m[5].OutputPass; Reflector = m[6].Reflector;
   } catch (err) { console.error(err); return fail('The 3D view could not load three.js. The timeline below still works.'); }
   let renderer;
   try { renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' }); }
   catch (err) { console.error(err); return fail('WebGL is not available here. The timeline below still works.'); }
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const glc = renderer.getContext(), dbg = glc.getExtension('WEBGL_debug_renderer_info');
+  const gpuRaw = String(glc.getParameter(dbg ? dbg.UNMASKED_RENDERER_WEBGL : glc.RENDERER) || '');
+  const software = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(gpuRaw);
+  const angle = gpuRaw.match(/^ANGLE \((?:[^,]*, )?([^,]+)/);
+  const gpuName = (angle ? angle[1].split(/\/| Direct3D| \(0x/)[0] : gpuRaw).trim().slice(0, 60);
+  const gpuEl = $('#gpuInfo');
+  gpuEl.textContent = software ? 'Software rendering (' + gpuName + '). Turn on hardware acceleration in the browser for ray tracing.' : 'GPU · ' + (gpuName || 'unknown');
+  gpuEl.classList.toggle('warn', software);
+  gpuEl.hidden = false;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
 
@@ -426,7 +436,7 @@ async function init3D() {
 
   const camera = new THREE.PerspectiveCamera(30, 2, 0.1, 300);
   const controls = new OrbitControls(camera, canvas);
-  controls.enableDamping = true; controls.dampingFactor = 0.09;
+  controls.enableDamping = true; controls.dampingFactor = 0.15;
   controls.minDistance = 8; controls.maxDistance = 90;
   controls.maxPolarAngle = 1.5; controls.zoomSpeed = 0.7;
   const HOME_DIR = new THREE.Vector3(-0.3, 0.47, 0.83).normalize();
@@ -446,7 +456,7 @@ async function init3D() {
       }
       if (ok) break;
     }
-    controls.update(); userMoved = false; touch();
+    controls.update(); userMoved = false; camChanged();
   }
 
   const mkTarget = () => new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 });
@@ -456,9 +466,33 @@ async function init3D() {
   composer.addPass(new OutputPass());
 
   // floor, slice sheet and blade
-  const floor = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshStandardMaterial({ color: 0x080b11, roughness: 0.2, metalness: 0.5, transparent: true, opacity: 0.925 }));
+  // Two floors with the same frosted look. The path tracer gets a rough metal and blurs reflections physically;
+  // the raster renderer gets a planar reflection smeared by a grainy disc blur.
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshStandardMaterial({ color: 0x8a93a6, roughness: 0.34, metalness: 1 }));
   floor.rotation.x = -Math.PI / 2;
-  scene.add(floor);
+  const frost = new Reflector(new THREE.PlaneGeometry(1, 1), {
+    textureWidth: 640, textureHeight: 320, clipBias: 0.003, color: 0x06080c,
+    shader: {
+      name: 'FrostedFloor',
+      uniforms: { color: { value: null }, tDiffuse: { value: null }, textureMatrix: { value: null } },
+      vertexShader: 'uniform mat4 textureMatrix; varying vec4 vUv; void main() { vUv = textureMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+      fragmentShader: [
+        'uniform vec3 color; uniform sampler2D tDiffuse; varying vec4 vUv;',
+        'void main() {',
+        '  vec2 uv = vUv.xy / vUv.w;',
+        '  float spin = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));',
+        '  vec3 acc = vec3(0.0);',
+        '  for (int i = 0; i < 16; i++) {',
+        '    float a = spin + float(i) * 2.3999632, r = sqrt((float(i) + 0.5) / 16.0);',
+        '    acc += texture2D(tDiffuse, uv + vec2(cos(a) * 0.016, sin(a) * 0.045) * r).rgb;',
+        '  }',
+        '  gl_FragColor = vec4(color + acc * (0.5 / 16.0), 1.0);',
+        '}',
+      ].join('\n'),
+    },
+  });
+  frost.rotation.x = -Math.PI / 2;
+  scene.add(frost);
   const tickMat = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x30415c, emissiveIntensity: 0.9, roughness: 1 });
   const ticks = new THREE.Group(); scene.add(ticks);
   const sheetMat = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0x8fd3ff, emissiveIntensity: 0.55, transparent: true, opacity: 0.075, side: THREE.DoubleSide, depthWrite: false, roughness: 1 });
@@ -474,8 +508,11 @@ async function init3D() {
   const slice = new THREE.Group(); slice.add(sheet, blade, ribbon, frameTop, frameA, frameB); scene.add(slice);
   const beadGeo = new THREE.SphereGeometry(0.085, 14, 10);
   const ridges = new THREE.Group(); scene.add(ridges);
-  // Raster stand-in for floor reflections: the ridges again, flipped under a slightly see-through floor. Path tracing swaps it for the real thing.
-  const mirror = new THREE.Group(); mirror.scale.y = -1; scene.add(mirror);
+  // The slice is drawn as an overlay on top of the path-traced picture. This scene holds it during ray tracing, with
+  // depth-only copies of the ridges so it still disappears behind them.
+  const overlayScene = new THREE.Scene(), occluders = new THREE.Group();
+  const occluderMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+  overlayScene.add(occluders);
   let bodies = [], crests = [], rests = [], beads = [], series = [], rowLabels = [], tickLabels = [];
 
   // Fill gradient for ridge faces: near black at the baseline, brightest just under the crest.
@@ -496,13 +533,11 @@ async function init3D() {
     for (let y = 0; y < h; y++) {
       const v = y / (h - 1), up = Math.max(0, v - 0.5) * 2;
       for (let x = 0; x < w; x++) {
-        const u = x / (w - 1);
-        const box = 1.8 * Math.exp(-(((u - 0.36) / 0.08) ** 2) - (((v - 0.86) / 0.07) ** 2)) + 0.5 * Math.exp(-(((u - 0.82) / 0.1) ** 2) - (((v - 0.78) / 0.08) ** 2));
         const hz = 0.02 * Math.exp(-(((v - 0.5) / 0.08) ** 2));
         const i = (y * w + x) * 4;
-        data[i] = toHalf(0.012 + 0.05 * up + hz + box * 0.9);
-        data[i + 1] = toHalf(0.016 + 0.075 * up + hz * 1.3 + box * 0.96);
-        data[i + 2] = toHalf(0.026 + 0.13 * up + hz * 1.9 + box);
+        data[i] = toHalf(0.012 + 0.06 * up + hz);
+        data[i + 1] = toHalf(0.016 + 0.09 * up + hz * 1.3);
+        data[i + 2] = toHalf(0.026 + 0.16 * up + hz * 1.9);
         data[i + 3] = toHalf(1);
       }
     }
@@ -564,24 +599,28 @@ async function init3D() {
     const crest = mkCrest(ci, 1.35), rest = mkCrest(cb, 0.16);
     const bead = new THREE.Mesh(beadGeo, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: col.clone().lerp(new THREE.Color(0xffffff), 0.35), emissiveIntensity: 3, roughness: 1 }));
     body.userData.i = i;
-    for (const m of [body, crest, rest]) {
-      m.position.z = zOf(i); ridges.add(m);
-      const twin = new THREE.Mesh(m.geometry, m.material); twin.position.z = zOf(i); mirror.add(twin);
-    }
+    for (const m of [body, crest, rest]) { m.position.z = zOf(i); ridges.add(m); }
+    const occ = new THREE.Mesh(bodyGeo, occluderMat); occ.position.z = zOf(i); occluders.add(occ);
     slice.add(bead);
     bodies.push(body); crests.push(crest); rests.push(rest); beads.push(bead); series.push(s);
   }
 
   function setRows() {
     for (const m of [...bodies, ...crests, ...rests]) { m.geometry.dispose(); m.material.dispose(); }
-    ridges.clear(); mirror.clear();
+    ridges.clear(); occluders.clear();
     for (const b of beads) { slice.remove(b); b.material.dispose(); }
     for (const t of ticks.children) t.geometry.dispose();
     ticks.clear(); bodies = []; crests = []; rests = []; beads = []; series = [];
     const R = S.rows.length;
     dz = clamp(11 / Math.max(1, R), 0.26, 0.8); D = dz * Math.max(0, R - 1);
     S.rows.forEach(buildRidge);
-    floor.scale.set(W + 400, D + 400, 1);
+    floor.scale.set(W + 400, D + 400, 1); frost.scale.copy(floor.scale);
+    // one persistent buffer for the slice outline, so moving the slice only rewrites vertex positions
+    const ribbonIdx = [];
+    for (let i = 0; i < R - 1; i++) { const a = i * 2; ribbonIdx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    ribbonGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(Math.max(2, R) * 6), 3));
+    ribbonGeo.deleteAttribute('normal');
+    ribbonGeo.setIndex(ribbonIdx);
     sheet.scale.set(D + 1.6, H + 0.9, 1); sheet.position.y = (H + 0.9) / 2;
     blade.scale.set(0.035, 0.02, D + 1.6); blade.position.y = 0.012;
     const SH = H + 0.9, SZ = D / 2 + 0.8;
@@ -611,17 +650,15 @@ async function init3D() {
   function setCursor() {
     const R = S.rows.length, x = xOf(S.t);
     slice.position.x = x;
-    const pos = new Float32Array(Math.max(2, R) * 6), idx = [];
+    const attr = ribbonGeo.getAttribute('position'), pos = attr.array;
     for (let i = 0; i < R; i++) {
       const y = sampleRow(i, S.t), z = zOf(i);
       beads[i].position.set(0, y, z);
       pos.set([0, y + 0.03, z, 0, y - 0.03, z], i * 6);
-      if (i < R - 1) { const a = i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
     }
-    ribbonGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    ribbonGeo.setIndex(idx);
+    attr.needsUpdate = true;
     ribbonGeo.computeVertexNormals();
-    sceneChanged();
+    touch();
   }
 
   function setHover(i) {
@@ -632,78 +669,122 @@ async function init3D() {
       rests[k].material.emissiveIntensity = hot ? 0.9 : 0.16;
       if (rowLabels[k]) rowLabels[k].el.classList.toggle('hot', hot);
     }
-    sceneChanged();
+    rt.matDirty = true; touch();
   }
 
-  // ---- render scheduling: raster while anything moves, path tracing once it has been still for a moment
-  let needsRender = true, lastChange = performance.now();
-  const rt = { on: false, pt: null, loading: false, active: false, sceneDirty: true, shown: false, max: 400, composer: null, pass: null, prev: 0, slow: 0, fast: 0 };
-  function rasterLook(on) {
-    if (on) { scene.add(mirror); slice.add(sheet); } else { scene.remove(mirror); slice.remove(sheet); }
-    const f = floor.material;
-    f.transparent = on; f.opacity = on ? 0.925 : 1; f.metalness = on ? 0.5 : 1; f.roughness = on ? 0.2 : 0.13; f.color.set(on ? 0x080b11 : 0x535b6b); f.needsUpdate = true;
+  // ---- render scheduling. With ray tracing on, the ridges and floor are path traced on the GPU and keep accumulating
+  // samples, and the slice is rasterised on top each frame, so playing or scrubbing never restarts the picture. Moving
+  // the camera, hovering a row or changing the rows does restart it. The raster renderer covers loading, shader
+  // compilation and GPUs that cannot hold a sample per frame while the camera moves.
+  let needsRender = true, lastCam = 0, look = 'raster';
+  const rt = { on: false, pt: null, loading: false, max: 400, composer: null, mix: null, overlay: null, geoDirty: true, matDirty: false, camDirty: false,
+    drawn: -1, spf: 2, prev: 0, slow: 0, fast: 0, liteCam: false, scale: 1, motion: false };
+  function setLook(next) {
+    if (look === next) return;
+    look = next;
+    if (next === 'traced') { scene.remove(frost); scene.add(floor); overlayScene.add(slice); }
+    else { scene.remove(floor); scene.add(frost); scene.add(slice); }
   }
-  function touch() { needsRender = true; lastChange = performance.now(); if (rt.active) { rt.active = false; rt.shown = false; rasterLook(true); } }
-  function sceneChanged() { rt.sceneDirty = true; touch(); }
-  controls.addEventListener('change', touch);
+  function touch() { needsRender = true; }
+  function camChanged() { rt.camDirty = true; lastCam = performance.now(); needsRender = true; }
+  function sceneChanged() { rt.geoDirty = true; needsRender = true; }
+  controls.addEventListener('change', camChanged);
   const setBadge = (text) => { badge.hidden = !text; badge.textContent = text || ''; };
 
   async function setRT(on) {
-    rt.on = on;
-    if (!on) { touch(); setBadge(''); return; }
-    if (!rt.pt && !rt.loading) {
-      rt.loading = true; setBadge('ray tracing · loading');
-      try {
-        const [m, tp] = await Promise.all([import('three-gpu-pathtracer'), import('three/addons/postprocessing/TexturePass.js')]);
-        const pt = new m.WebGLPathTracer(renderer);
-        pt.renderToCanvas = false; pt.rasterizeScene = false; pt.dynamicLowRes = false;
-        pt.renderDelay = 0; pt.minSamples = 0; pt.bounces = 5; pt.filterGlossyFactor = 0.6;
-        pt.tiles.set(2, 2);
-        pt.renderScale = Math.min(1, 1.25 / renderer.getPixelRatio());
-        rt.pass = new tp.TexturePass(pt.target.texture);
-        rt.composer = new EffectComposer(renderer, mkTarget());
-        rt.composer.addPass(rt.pass);
-        rt.composer.addPass(new UnrealBloomPass(new THREE.Vector2(4, 4), 0.38, 0.5, 0.85));
-        rt.composer.addPass(new OutputPass());
-        rt.pt = pt; rt.sceneDirty = true;
-        resize();
-      } catch (err) {
-        console.error(err); rt.on = false; $('#rt').checked = false; setBadge('ray tracing unavailable in this browser');
-      }
-      rt.loading = false;
+    rt.on = on; needsRender = true;
+    try { localStorage.setItem('stracewave.rt', on ? '1' : '0'); } catch (err) { /* storage is optional */ }
+    if (!on) { setBadge(''); return; }
+    if (rt.pt || rt.loading) return;
+    rt.loading = true; setBadge('ray tracing · loading');
+    try {
+      const [m, sp] = await Promise.all([import('three-gpu-pathtracer'), import('three/addons/postprocessing/ShaderPass.js')]);
+      const pt = new m.WebGLPathTracer(renderer);
+      pt.renderToCanvas = false; pt.rasterizeScene = false; pt.dynamicLowRes = false;
+      pt.renderDelay = 0; pt.minSamples = 0; pt.bounces = 5; pt.filterGlossyFactor = 0.6;
+      pt.tiles.set(1, 1);
+      rt.scale = Math.min(1, 1.25 / renderer.getPixelRatio());
+      pt.renderScale = rt.scale;
+      pt.target.texture.minFilter = pt.target.texture.magFilter = THREE.LinearFilter;
+      rt.overlay = new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 });
+      rt.mix = new sp.ShaderPass({
+        name: 'TracedPlusSlice',
+        uniforms: { tTraced: { value: null }, tSlice: { value: null } },
+        vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+        fragmentShader: 'uniform sampler2D tTraced; uniform sampler2D tSlice; varying vec2 vUv; void main() { vec4 s = texture2D(tSlice, vUv); gl_FragColor = vec4(texture2D(tTraced, vUv).rgb * (1.0 - s.a) + s.rgb, 1.0); }',
+      });
+      rt.composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType }));
+      rt.composer.addPass(rt.mix);
+      rt.composer.addPass(new UnrealBloomPass(new THREE.Vector2(4, 4), 0.38, 0.5, 0.85));
+      rt.composer.addPass(new OutputPass());
+      rt.pt = pt; rt.geoDirty = true;
+      resize();
+    } catch (err) {
+      console.error(err); rt.on = false; $('#rt').checked = false; setBadge('ray tracing unavailable in this browser');
     }
-    touch();
+    rt.loading = false;
   }
 
-  function rasterRender() { composer.render(); needsRender = false; placeLabels(); }
+  function rasterRender() { setLook('raster'); composer.render(); needsRender = false; placeLabels(); }
+
+  function tracedRender() {
+    const alpha = renderer.getClearAlpha();
+    renderer.setRenderTarget(rt.overlay); renderer.setClearAlpha(0); renderer.clear();
+    renderer.render(overlayScene, camera);
+    renderer.setRenderTarget(null); renderer.setClearAlpha(alpha);
+    rt.mix.uniforms.tTraced.value = rt.pt.target.texture;
+    rt.mix.uniforms.tSlice.value = rt.overlay.texture;
+    rt.composer.render();
+    rt.drawn = rt.pt.samples; needsRender = false; placeLabels();
+  }
 
   function frame(now) {
     controls.update();
-    if (rt.on && rt.pt && !S.playing && now - lastChange > 450) {
-      try {
-        if (!rt.active) {
-          rasterLook(false);
-          if (rt.sceneDirty) { rt.pt.setScene(scene, camera); rt.sceneDirty = false; } else rt.pt.updateCamera();
-          rt.active = true; rt.shown = false;
-        }
-        if (rt.pt.samples < rt.max) {
-          const gap = now - rt.prev; rt.prev = now;
-          if (!rt.pt.isCompiling && gap < 200) {
-            if (gap < 20) { rt.fast++; rt.slow = 0; } else if (gap > 45) { rt.slow++; rt.fast = 0; }
-            if (rt.fast > 20 && rt.pt.tiles.x > 1) { rt.pt.tiles.set(1, 1); rt.fast = 0; }
-            if (rt.slow > 6 && rt.pt.tiles.x < 3) { rt.pt.tiles.set(rt.pt.tiles.x + 1, rt.pt.tiles.x + 1); rt.slow = 0; }
+    const gap = now - rt.prev; rt.prev = now;
+    if (rt.on && rt.pt) {
+      const camBusy = now - lastCam < 250;
+      if (rt.liteCam && camBusy) setBadge('ray tracing · resumes when the camera stops');
+      else {
+        try {
+          setLook('traced');
+          if (camBusy !== rt.motion) {
+            rt.motion = camBusy;
+            rt.pt.renderScale = rt.scale * (camBusy ? 0.6 : 1);
+            rt.pt.bounces = camBusy ? 3 : 5;
+            rt.camDirty = true;
           }
-          rt.pt.renderSample();
-          if (rt.pt.samples >= 3) { rt.pass.map = rt.pt.target.texture; rt.composer.render(); rt.shown = true; }
-          setBadge(rt.pt.isCompiling ? 'ray tracing · compiling shaders' : 'ray tracing · ' + Math.floor(rt.pt.samples) + ' / ' + rt.max + ' samples');
-        } else setBadge('ray tracing · ' + rt.max + ' samples');
-      } catch (err) {
-        console.error(err); rt.on = false; $('#rt').checked = false; touch(); setBadge('ray tracing failed, back to raster');
+          if (rt.geoDirty || rt.matDirty || rt.camDirty) {
+            if (rt.geoDirty) rt.pt.setScene(scene, camera);
+            else { if (rt.matDirty) rt.pt.updateMaterials(); if (rt.camDirty) rt.pt.updateCamera(); }
+            rt.geoDirty = rt.matDirty = rt.camDirty = false; rt.drawn = -1;
+          }
+          const compiling = rt.pt.isCompiling;
+          if (rt.pt.samples < rt.max) {
+            if (!compiling && gap < 200) {
+              // steer samples per frame by frame time
+              if (gap < 19) { rt.slow = 0; if (++rt.fast > 10) { rt.fast = 0; rt.spf = Math.min(12, rt.spf + 1); } }
+              else if (gap > 30) {
+                rt.fast = 0;
+                if (++rt.slow > 3) {
+                  rt.slow = 0;
+                  if (rt.spf > 1) rt.spf--;
+                  else if (camBusy) rt.liteCam = true;
+                  else if (rt.pt.tiles.x < 3) rt.pt.tiles.set(rt.pt.tiles.x + 1, rt.pt.tiles.x + 1);
+                }
+              }
+            }
+            const n = compiling ? 1 : rt.spf;
+            for (let k = 0; k < n && rt.pt.samples < rt.max; k++) rt.pt.renderSample();
+          }
+          if (rt.pt.samples >= 1) { if (rt.pt.samples !== rt.drawn || needsRender) tracedRender(); }
+          else if (needsRender) rasterRender();
+          setBadge(compiling ? 'ray tracing · compiling shaders' : 'ray tracing · ' + Math.floor(rt.pt.samples) + ' / ' + rt.max + ' samples');
+          return;
+        } catch (err) {
+          console.error(err); rt.on = false; $('#rt').checked = false; needsRender = true; setBadge('ray tracing failed, using the standard renderer');
+        }
       }
-      if (!rt.shown && needsRender) rasterRender();
-      return;
     }
-    if (rt.on && rt.pt && !rt.active) setBadge(S.playing ? 'ray tracing · paused while playing' : 'ray tracing · waiting for stillness');
     if (needsRender) rasterRender();
   }
 
@@ -731,10 +812,10 @@ async function init3D() {
     const w = Math.max(2, stage.clientWidth), h = Math.max(2, stage.clientHeight);
     renderer.setSize(w, h, false);
     composer.setSize(w, h);
-    if (rt.composer) rt.composer.setSize(w, h);
+    if (rt.composer) { rt.composer.setSize(w, h); const pr = renderer.getPixelRatio(); rt.overlay.setSize(Math.round(w * pr), Math.round(h * pr)); }
     camera.aspect = w / h; camera.updateProjectionMatrix();
     if (!userMoved) resetView();
-    touch();
+    camChanged();
   }
   new ResizeObserver(resize).observe(stage);
 
@@ -758,7 +839,7 @@ async function init3D() {
   canvas.addEventListener('pointerup', (e) => { if (down && Math.hypot(e.clientX - down[0], e.clientY - down[1]) < 5) { const h = pick(e); if (h) api.onPick(h.t); } down = null; });
   canvas.addEventListener('pointerleave', () => { api.onHover(-1); hideTip(); });
 
-  const api = { setRows, setCursor, setHover, setRT, resetView, touch, frame, onHover: () => {}, onPick: () => {}, debug: { rt, scene, camera, renderer } };
+  const api = { software, setRows, setCursor, setHover, setRT, resetView, touch, frame, onHover: () => {}, onPick: () => {}, debug: { rt, scene, camera, renderer } };
   resize();
   setRows();
   return api;
@@ -790,6 +871,10 @@ function start() {
     v.onPick = setT;
     view3d = v;
     window.__wt = { S, view3d: v };
+    let wantRT = !v.software && !window.matchMedia('(pointer: coarse)').matches;
+    try { const saved = localStorage.getItem('stracewave.rt'); if (saved !== null) wantRT = saved === '1'; } catch (err) { /* storage is optional */ }
+    $('#rt').checked = wantRT;
+    if (wantRT) v.setRT(true);
   });
 }
 openExample('uv');

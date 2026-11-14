@@ -38,7 +38,7 @@ Then press **Open strace log…** or drop the file on the page. The log is parse
 - **Light sheet**: the time slice. Press play, drag the bars in the timeline, or click the 3D view to move it. The line on the sheet joins every row's height at that instant.
 - **Slice panel**: the processes alive at the slice, longest-running first. Click one to copy its command.
 - **Timeline**: green has finished, yellow is running now, dots have not started. The footer counts individual processes.
-- **Ray tracing**: off by default. When on, the scene is path traced once it has been still for a moment and returns to the normal renderer as soon as anything moves. The first use compiles shaders, which took about 10 seconds on the machine this was developed on.
+- **Ray tracing**: on by default on desktop, and the choice is remembered per browser. The ridges and floor are path traced on the GPU and keep refining, while the slice is drawn on top each frame, so playing and scrubbing do not restart the picture. Moving the camera restarts it at reduced resolution until the camera stops. The first use compiles shaders, which took about 10 seconds on the machine this was developed on. The corner of the 3D view names the GPU the browser is using; if that is a software renderer, ray tracing stays off.
 
 ## How the process tree is built
 
@@ -71,4 +71,6 @@ The log format and the example traces come from [straceprof](https://github.com/
 
 At runtime the page loads [three.js](https://threejs.org/), [three-mesh-bvh](https://github.com/gkjohnson/three-mesh-bvh) and [three-gpu-pathtracer](https://github.com/gkjohnson/three-gpu-pathtracer) from a CDN; none of them is vendored here.
 
-No license has been chosen yet for stracewave's own code.
+## License
+
+MIT. See `LICENSE`. The example traces carry straceprof's MIT notice in `NOTICE`.
