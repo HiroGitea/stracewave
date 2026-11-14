@@ -493,6 +493,57 @@ function updateUI() {
   $('#sliceMore').textContent = live.length > show.length ? '+ ' + (live.length - show.length) + ' more' : (live.length ? '' : 'Nothing is running at this instant.');
 }
 
+// ---------------------------------------------------------------- sound
+// The heights the slice cuts through, row by row, become one cycle of an oscillator's waveform, so the timbre follows
+// which programs are running. Pitch and loudness follow how busy the machine is. It sounds while the slice moves.
+const audio = { ctx: null, osc: null, gain: null, on: false, moved: 0 };
+function levelAt(n, t) {
+  const s = seriesOf(n, BINS_3D), f = clamp(((t - S.v0) / (S.v1 - S.v0)) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
+  return s[a] + (s[b] - s[a]) * (f - a);
+}
+function setSound(on) {
+  audio.on = on;
+  if (on && !audio.ctx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) { $('#sound').checked = false; audio.on = false; toast('This browser has no Web Audio.'); return; }
+    audio.ctx = new Ctx();
+    audio.osc = audio.ctx.createOscillator();
+    const filter = audio.ctx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 2200;
+    audio.gain = audio.ctx.createGain(); audio.gain.gain.value = 0;
+    audio.osc.connect(filter).connect(audio.gain).connect(audio.ctx.destination);
+    audio.osc.start();
+  }
+  if (audio.ctx) { if (on) audio.ctx.resume(); else audio.gain.gain.setTargetAtTime(0, audio.ctx.currentTime, 0.05); }
+}
+function updateSound(now) {
+  if (!audio.on || !audio.ctx) return;
+  const at = audio.ctx.currentTime, rows = S.rows3, N = 128, K = 32;
+  const sounding = (S.playing || now - audio.moved < 250) && rows.length > 0;
+  const busy = levelAt(S.busy, S.t) / Math.max(1, S.cores);
+  let energy = 0;
+  if (sounding) {
+    // half a cycle walks across the rows, the other half is its negative mirror, so the cycle has no DC offset
+    const half = new Float32Array(N / 2);
+    for (let i = 0; i < N / 2; i++) {
+      const f = (i / (N / 2 - 1)) * (rows.length - 1), a = Math.floor(f), b = Math.min(rows.length - 1, a + 1);
+      const ha = hOf(levelAt(rows[a], S.t)), hb = hOf(levelAt(rows[b], S.t));
+      half[i] = (ha + (hb - ha) * (f - a)) * Math.sin((Math.PI * i) / (N / 2 - 1));
+      energy += half[i] * half[i];
+    }
+    if (energy > 1e-4) {
+      const real = new Float32Array(K + 1), imag = new Float32Array(K + 1);
+      for (let k = 1; k <= K; k++) {
+        let re = 0, im = 0;
+        for (let i = 0; i < N; i++) { const x = i < N / 2 ? half[i] : -half[N - 1 - i], ph = (2 * Math.PI * k * i) / N; re += x * Math.cos(ph); im += x * Math.sin(ph); }
+        real[k] = (2 * re) / N; imag[k] = (2 * im) / N;
+      }
+      audio.osc.setPeriodicWave(audio.ctx.createPeriodicWave(real, imag));
+      audio.osc.frequency.setTargetAtTime(55 * Math.pow(2, clamp(busy, 0, 2)), at, 0.06);
+    }
+  }
+  audio.gain.gain.setTargetAtTime(sounding && energy > 1e-4 ? 0.1 * clamp(0.3 + busy, 0.3, 1) : 0, at, 0.07);
+}
+
 // ---------------------------------------------------------------- shared interactions
 const tip = $('#tip');
 function showTip(html, x, y) {
@@ -525,6 +576,7 @@ function setHover(i) {
 }
 function setT(t) {
   S.t = clamp(t, S.v0, S.v1);
+  audio.moved = performance.now();
   dirty.tl = dirty.ui = true;
   if (view3d) view3d.setCursor();
 }
@@ -605,6 +657,11 @@ document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer && e.dataTransfer.files[0]; if (f) openFile(f); });
 $('#resetView').addEventListener('click', () => { if (view3d) view3d.resetView(); });
 $('#rt').addEventListener('change', (e) => { if (view3d) view3d.setRT(e.target.checked); else e.target.checked = false; });
+$('#glass').addEventListener('change', (e) => {
+  try { localStorage.setItem('stracewave.glass', e.target.checked ? '1' : '0'); } catch (err) { /* storage is optional */ }
+  if (view3d) view3d.setGlass(e.target.checked);
+});
+$('#sound').addEventListener('change', (e) => setSound(e.target.checked));
 $('#sliceList').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   const p = S.procs[+b.dataset.p], text = (p.cmd || p.prog) + '\n' + fmtD(p.end - p.start);
@@ -736,6 +793,11 @@ async function init3D() {
   // depth-only copies of the ridges so it still disappears behind them.
   const overlayScene = new THREE.Scene(), occluders = new THREE.Group();
   const occluderMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+  // In front of a glass ridge the slice should show through, dimmed: this multiplies what is already drawn instead of hiding it.
+  const veilMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.4, depthWrite: false, blending: THREE.CustomBlending,
+    blendSrc: THREE.ZeroFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor });
+  const WHITE = new THREE.Color(0xffffff);
+  let glass = true;
   overlayScene.add(occluders);
   const wall = new THREE.Group(); scene.add(wall);
   // per-row state, indexed like S.rows3
@@ -812,7 +874,8 @@ async function init3D() {
     bodyGeo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     bodyGeo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
     bodyGeo.setIndex(idx);
-    const body = new THREE.Mesh(bodyGeo, new THREE.MeshStandardMaterial({ color: col.clone().multiplyScalar(0.05), roughness: 0.4, metalness: 0, emissive: col, emissiveMap: fillTex, emissiveIntensity: fill }));
+    const body = new THREE.Mesh(bodyGeo, new THREE.MeshPhysicalMaterial({ color: col.clone().multiplyScalar(0.05), roughness: 0.4, metalness: 0, emissive: col, emissiveMap: fillTex, emissiveIntensity: fill }));
+    let base = fill, hot = false, dim = false;
     const cp = new Float32Array(P * 18), ci = [], cb = [];
     for (let k = 0; k < P; k++) {
       const x = xs[k], y = hs[k], kp = Math.max(0, k - 1), kn = Math.min(P - 1, k + 1);
@@ -832,10 +895,20 @@ async function init3D() {
     const crest = mkCrest(ci, 1.35), rest = mkCrest(cb, 0.16);
     return {
       meshes: [body, crest, rest], solids: [body], hs, th,
-      tone(hot, dim) {
-        body.material.emissiveIntensity = fill * (hot ? 1.9 : dim ? 0.55 : 1);
+      tone(h, d) {
+        hot = h; dim = d;
+        body.material.emissiveIntensity = base * (hot ? 1.9 : dim ? 0.55 : 1);
         crest.material.emissiveIntensity = hot ? 2.6 : dim ? 0.7 : 1.35;
         rest.material.emissiveIntensity = hot ? 0.9 : 0.16;
+      },
+      // Glass: the path tracer refracts through a tinted pane; the raster renderer stands in with plain transparency.
+      look(asGlass, traced) {
+        const m = body.material;
+        if (!asGlass) { m.transmission = 0; m.transparent = false; m.opacity = 1; m.depthWrite = true; m.roughness = 0.4; m.color.copy(col).multiplyScalar(0.05); base = fill; }
+        else if (traced) { m.transmission = 1; m.ior = 1.45; m.transparent = false; m.opacity = 1; m.depthWrite = true; m.roughness = 0.05; m.color.copy(col).lerp(WHITE, 0.55); m.attenuationColor.copy(col).lerp(WHITE, 0.3); m.attenuationDistance = 0.12; base = fill * 0.4; }
+        else { m.transmission = 0; m.transparent = true; m.opacity = 0.42; m.depthWrite = false; m.roughness = 0.15; m.color.copy(col).multiplyScalar(0.12); base = fill * 0.75; }
+        m.needsUpdate = true;
+        this.tone(hot, dim);
       },
     };
   }
@@ -889,7 +962,7 @@ async function init3D() {
     const th = Math.min(0.07, dz * 0.22);
     const place = (rec, z, group) => {
       for (const m of rec.meshes) { m.position.z = z; group.add(m); }
-      for (const m of rec.solids) { const occ = new THREE.Mesh(m.geometry, occluderMat); occ.position.z = z; occluders.add(occ); }
+      for (const m of rec.solids) { const occ = new THREE.Mesh(m.geometry, occluderMat); occ.position.z = z; occ.userData.pane = !!rec.look && group === ridges; occluders.add(occ); }
     };
     const mkBead = (color, z) => {
       const b = new THREE.Mesh(beadGeo, new THREE.MeshStandardMaterial({ color: 0x000000, emissive: color.clone().lerp(new THREE.Color(0xffffff), 0.35), emissiveIntensity: 3, roughness: 1 }));
@@ -969,10 +1042,20 @@ async function init3D() {
     crit.sort((a, b) => b.d - a.d).slice(0, 3).forEach((c) => fixedLabels.push({ el: label('crit', shortLabel(c.seg.p) + ' · ' + fmtD(c.seg.end - c.seg.start)), p: c.p, align: 'center' }));
     for (let i = 0; i < 3; i++) { const el = label('tag', ''); el.hidden = true; tagEls.push(el); }
     setHover(S.hover >= 0 ? S.r3[S.hover] : -1);
+    applyLook();
     setCursor();
     if (!userMoved) resetView();
     sceneChanged();
   }
+
+  // Materials that differ between the two renderers, and between glass and solid ridges.
+  function applyLook() {
+    const traced = look === 'traced';
+    for (const rec of gl) if (rec.look) rec.look(glass, traced);
+    for (const occ of occluders.children) { const pane = glass && occ.userData.pane; occ.material = pane ? veilMat : occluderMat; occ.renderOrder = pane ? 10 : 0; }
+    sheetMat.depthWrite = traced;
+  }
+  function setGlass(on) { glass = on; applyLook(); sceneChanged(); }
 
   function updateArcs() {
     const pa = arcGeo.getAttribute('position'), ca = arcGeo.getAttribute('color'), pos = pa.array, col = ca.array;
@@ -1042,6 +1125,7 @@ async function init3D() {
     look = next;
     if (next === 'traced') { scene.remove(frost); scene.add(floor); overlayScene.add(slice, arcs); }
     else { scene.remove(floor); scene.add(frost); scene.add(slice, arcs); }
+    applyLook();
   }
   function touch() { needsRender = true; }
   function camChanged() { rt.camDirty = true; lastCam = performance.now(); needsRender = true; }
@@ -1219,14 +1303,14 @@ async function init3D() {
   canvas.addEventListener('pointerleave', () => { api.onHover(-1); hideTip(); });
   canvas.addEventListener('dblclick', (e) => { const h = pick(e); if (h && h.i >= 0) api.onUnfold(S.rows3[h.i]); });
 
-  const api = { software, setRows, setCursor, setHover, setTags, setRT, resetView, touch, frame, onHover: () => {}, onPick: () => {}, onUnfold: () => {}, debug: { rt, scene, camera, renderer } };
+  const api = { software, setRows, setCursor, setHover, setTags, setRT, setGlass, resetView, touch, frame, onHover: () => {}, onPick: () => {}, onUnfold: () => {}, debug: { rt, scene, camera, renderer } };
   resize();
   setRows();
   return api;
 }
 
 // ---------------------------------------------------------------- boot
-let last = performance.now(), lastUI = 0;
+let last = performance.now(), lastUI = 0, lastSound = 0;
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now;
   if (S.playing) {
@@ -1235,6 +1319,7 @@ function frame(now) {
   }
   if (dirty.tl) { drawTimeline(); dirty.tl = false; }
   if (dirty.ui && now - lastUI > 90) { updateUI(); dirty.ui = false; lastUI = now; }
+  if (audio.on && now - lastSound > 80) { updateSound(now); lastSound = now; }
   if (view3d) view3d.frame(now);
   requestAnimationFrame(frame);
 }
@@ -1251,11 +1336,15 @@ function start() {
     v.onPick = setT;
     v.onUnfold = (n) => { if (S.unfolded.has(n.id)) S.unfolded.delete(n.id); else S.unfolded.add(n.id); S.hover = -1; rowsChanged(); };
     view3d = v;
-    window.__wt = { S, view3d: v };
+    window.__wt = { S, view3d: v, audio };
     let wantRT = !v.software && !window.matchMedia('(pointer: coarse)').matches;
     try { const saved = localStorage.getItem('stracewave.rt'); if (saved !== null) wantRT = saved === '1'; } catch (err) { /* storage is optional */ }
     $('#rt').checked = wantRT;
     if (wantRT) v.setRT(true);
+    let wantGlass = true;
+    try { wantGlass = localStorage.getItem('stracewave.glass') !== '0'; } catch (err) { /* storage is optional */ }
+    $('#glass').checked = wantGlass;
+    v.setGlass(wantGlass);
   });
 }
 openExample('uv');
