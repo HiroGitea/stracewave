@@ -875,7 +875,7 @@ async function init3D() {
     bodyGeo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
     bodyGeo.setIndex(idx);
     const body = new THREE.Mesh(bodyGeo, new THREE.MeshPhysicalMaterial({ color: col.clone().multiplyScalar(0.05), roughness: 0.4, metalness: 0, emissive: col, emissiveMap: fillTex, emissiveIntensity: fill }));
-    let base = fill, hot = false, dim = false;
+    let base = fill, hot = false, dim = false, applied = 0;
     const cp = new Float32Array(P * 18), ci = [], cb = [];
     for (let k = 0; k < P; k++) {
       const x = xs[k], y = hs[k], kp = Math.max(0, k - 1), kn = Math.min(P - 1, k + 1);
@@ -903,6 +903,9 @@ async function init3D() {
       },
       // Glass: the path tracer refracts through a tinted pane; the raster renderer stands in with plain transparency.
       look(asGlass, traced) {
+        const state = asGlass ? (traced ? 2 : 1) : 0;
+        if (state === applied) return;
+        applied = state;
         const m = body.material;
         if (!asGlass) { m.transmission = 0; m.transparent = false; m.opacity = 1; m.depthWrite = true; m.roughness = 0.4; m.color.copy(col).multiplyScalar(0.05); base = fill; }
         else if (traced) { m.transmission = 1; m.ior = 1.45; m.transparent = false; m.opacity = 1; m.depthWrite = true; m.roughness = 0.05; m.color.copy(col).lerp(WHITE, 0.55); m.attenuationColor.copy(col).lerp(WHITE, 0.3); m.attenuationDistance = 0.12; base = fill * 0.4; }
@@ -1120,6 +1123,11 @@ async function init3D() {
   let needsRender = true, lastCam = 0, look = 'raster';
   const rt = { on: false, pt: null, loading: false, max: 400, composer: null, mix: null, overlay: null, geoDirty: true, matDirty: false, camDirty: false,
     drawn: -1, spf: 2, prev: 0, slow: 0, fast: 0, liteCam: false, scale: 1, motion: false };
+  // Temporal accumulation, the way games keep ray tracing affordable. While something is changing, only one sample
+  // per pixel is traced each frame and blended into the previous frame's picture, which is first re-projected
+  // through the new camera using the world position each pixel sees. `hist` holds the running picture (alpha counts
+  // how many frames went into a pixel); `pos` holds the world positions for this frame and the last.
+  const tmp = { on: false, hist: [], pos: [], hi: 0, pi: 0, prevVP: new THREE.Matrix4(), quad: null, mat: null, posMat: null, reset: true, camMoved: true, fast: 0 };
   function setLook(next) {
     if (look === next) return;
     look = next;
@@ -1140,7 +1148,7 @@ async function init3D() {
     if (rt.pt || rt.loading) return;
     rt.loading = true; setBadge('ray tracing · loading');
     try {
-      const [m, sp] = await Promise.all([import('three-gpu-pathtracer'), import('three/addons/postprocessing/ShaderPass.js')]);
+      const [m, sp, ps] = await Promise.all([import('three-gpu-pathtracer'), import('three/addons/postprocessing/ShaderPass.js'), import('three/addons/postprocessing/Pass.js')]);
       const pt = new m.WebGLPathTracer(renderer);
       pt.renderToCanvas = false; pt.rasterizeScene = false; pt.dynamicLowRes = false;
       pt.renderDelay = 0; pt.minSamples = 0; pt.bounces = 5; pt.filterGlossyFactor = 0.6;
@@ -1159,6 +1167,57 @@ async function init3D() {
       rt.composer.addPass(rt.mix);
       rt.composer.addPass(new UnrealBloomPass(new THREE.Vector2(4, 4), 0.38, 0.5, 0.85));
       rt.composer.addPass(new OutputPass());
+      const histOpts = { type: THREE.HalfFloatType, depthBuffer: false };
+      const posOpts = { type: THREE.FloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter };
+      tmp.hist = [new THREE.WebGLRenderTarget(4, 4, histOpts), new THREE.WebGLRenderTarget(4, 4, histOpts)];
+      tmp.pos = [new THREE.WebGLRenderTarget(4, 4, posOpts), new THREE.WebGLRenderTarget(4, 4, posOpts)];
+      tmp.posMat = new THREE.ShaderMaterial({
+        side: THREE.DoubleSide,
+        vertexShader: 'varying vec3 vW; void main() { vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+        fragmentShader: 'varying vec3 vW; void main() { gl_FragColor = vec4(vW, 1.0); }',
+      });
+      tmp.mat = new THREE.ShaderMaterial({
+        depthTest: false, depthWrite: false,
+        uniforms: { tNew: { value: null }, tHist: { value: null }, tPos: { value: null }, tPosPrev: { value: null }, prevVP: { value: tmp.prevVP }, mode: { value: 1 }, cap: { value: 30 }, soft: { value: 0 }, px: { value: new THREE.Vector2() } },
+        vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+        fragmentShader: [
+          'uniform sampler2D tNew, tHist, tPos, tPosPrev; uniform mat4 prevVP; uniform float mode, cap, soft; uniform vec2 px; varying vec2 vUv;',
+          '// a single sample can be wildly bright (a firefly); clamp it so one of them cannot outweigh the history',
+          'vec3 fresh(vec2 uv) { vec3 c = texture2D(tNew, uv).rgb; float l = max(c.r, max(c.g, c.b)); return l > 3.0 ? c * (3.0 / l) : c; }',
+          'void main() {',
+          '  if (mode > 1.5) { gl_FragColor = vec4(texture2D(tNew, vUv).rgb, cap); return; }      // seed the history with a finished picture',
+          '  vec3 cur = fresh(vUv);',
+          '  vec4 P = texture2D(tPos, vUv);',
+          '  vec4 c = prevVP * vec4(P.xyz, 1.0);',
+          '  if (soft > 0.5 && P.a > 0.5) {',
+          '    // while moving, average the new sample with its neighbours that lie on the same surface',
+          '    float sigma = 0.05 + 0.01 * abs(c.w), wsum = 1.0;',
+          '    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {',
+          '      if (i == 0 && j == 0) continue;',
+          '      vec2 o = vUv + vec2(float(i), float(j)) * px * 1.5;',
+          '      vec4 Pn = texture2D(tPos, o); vec3 d = Pn.xyz - P.xyz;',
+          '      float w = Pn.a > 0.5 ? exp(-dot(d, d) / (sigma * sigma)) : 0.0;',
+          '      cur += fresh(o) * w; wsum += w;',
+          '    }',
+          '    cur /= wsum;',
+          '  }',
+          '  vec2 uv = vUv; bool ok = mode < 0.5;',
+          '  if (ok && P.a > 0.5) {',
+          '    uv = c.xy / c.w * 0.5 + 0.5;',
+          '    ok = c.w > 0.0 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;',
+          '    if (ok) {',
+          '      vec4 Q = texture2D(tPosPrev, uv);',
+          '      float dq = (prevVP * vec4(Q.xyz, 1.0)).w;',
+          '      ok = Q.a > 0.5 && abs(dq - c.w) < 0.02 + 0.012 * c.w;      // same surface as last frame, or newly revealed?',
+          '    }',
+          '  } else if (ok) { ok = texture2D(tPosPrev, uv).a < 0.5; }',
+          '  float n = 0.0; vec3 col = cur;',
+          '  if (ok) { vec4 h = texture2D(tHist, uv); n = min(h.a, cap); col = mix(h.rgb, cur, 1.0 / (n + 1.0)); }',
+          '  gl_FragColor = vec4(col, n + 1.0);',
+          '}',
+        ].join('\n'),
+      });
+      tmp.quad = new ps.FullScreenQuad(tmp.mat);
       rt.pt = pt; rt.geoDirty = true;
       resize();
     } catch (err) {
@@ -1169,15 +1228,50 @@ async function init3D() {
 
   function rasterRender() { setLook('raster'); composer.render(); needsRender = false; placeLabels(); }
 
-  function tracedRender() {
+  function tracedRender(texture) {
     const alpha = renderer.getClearAlpha();
     renderer.setRenderTarget(rt.overlay); renderer.setClearAlpha(0); renderer.clear();
     renderer.render(overlayScene, camera);
     renderer.setRenderTarget(null); renderer.setClearAlpha(alpha);
-    rt.mix.uniforms.tTraced.value = rt.pt.target.texture;
+    rt.mix.uniforms.tTraced.value = texture;
     rt.mix.uniforms.tSlice.value = rt.overlay.texture;
     rt.composer.render();
     rt.drawn = rt.pt.samples; needsRender = false; placeLabels();
+  }
+
+  // Copy the finished picture into the history, so the first frame of a change starts from it instead of from noise.
+  function seedHistory() {
+    const u = tmp.mat.uniforms;
+    u.mode.value = 2; u.cap.value = 30; u.tNew.value = rt.pt.target.texture;
+    renderer.setRenderTarget(tmp.hist[tmp.hi]); tmp.quad.render(renderer); renderer.setRenderTarget(null);
+  }
+
+  // One frame of temporal accumulation; returns the texture to show.
+  function temporalStep(now) {
+    const u = tmp.mat.uniforms, alpha = renderer.getClearAlpha();
+    let cur = tmp.pos[tmp.pi];
+    if (tmp.camMoved || tmp.reset) {
+      // world position seen by each pixel, drawn with the same geometry the path tracer sees
+      cur = tmp.pos[1 - tmp.pi];
+      const bg = scene.background;
+      scene.background = null; scene.overrideMaterial = tmp.posMat;
+      renderer.setRenderTarget(cur); renderer.setClearAlpha(0); renderer.clear();
+      renderer.render(scene, camera);
+      scene.overrideMaterial = null; scene.background = bg; renderer.setClearAlpha(alpha);
+    }
+    u.mode.value = tmp.reset ? 1 : 0;
+    u.cap.value = now - tmp.fast < 300 ? 5 : 30;       // adapt quickly right after a highlight changes
+    u.soft.value = rt.motion ? 1 : 0;
+    u.px.value.set(1 / rt.pt.target.width, 1 / rt.pt.target.height);
+    u.tNew.value = rt.pt.target.texture;
+    u.tHist.value = tmp.hist[tmp.hi].texture;
+    u.tPos.value = cur.texture; u.tPosPrev.value = tmp.pos[tmp.pi].texture;
+    renderer.setRenderTarget(tmp.hist[1 - tmp.hi]); tmp.quad.render(renderer); renderer.setRenderTarget(null);
+    tmp.hi = 1 - tmp.hi;
+    if (cur !== tmp.pos[tmp.pi]) tmp.pi = 1 - tmp.pi;
+    tmp.prevVP.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    tmp.reset = false; tmp.camMoved = false;
+    return tmp.hist[tmp.hi].texture;
   }
 
   function frame(now) {
@@ -1191,35 +1285,46 @@ async function init3D() {
           setLook('traced');
           if (camBusy !== rt.motion) {
             rt.motion = camBusy;
-            rt.pt.renderScale = rt.scale * (camBusy ? 0.6 : 1);
-            rt.pt.bounces = camBusy ? 3 : 5;
+            rt.pt.renderScale = rt.scale * (camBusy ? 0.5 : 1);
+            rt.pt.bounces = camBusy ? 2 : 5;
+            rt.pt.transmissiveBounces = camBusy ? 4 : 10;
             rt.camDirty = true;
           }
           if (rt.geoDirty || rt.matDirty || rt.camDirty) {
-            if (rt.geoDirty) rt.pt.setScene(scene, camera);
-            else { if (rt.matDirty) rt.pt.updateMaterials(); if (rt.camDirty) rt.pt.updateCamera(); }
-            rt.geoDirty = rt.matDirty = rt.camDirty = false; rt.drawn = -1;
+            // going from a finished picture into a change: keep that picture as the starting history
+            if (!tmp.on && !rt.geoDirty && !tmp.reset && rt.pt.samples >= 8) seedHistory();
+            if (rt.geoDirty) { rt.pt.setScene(scene, camera); tmp.reset = true; }
+            else {
+              if (rt.matDirty) { rt.pt.updateMaterials(); tmp.fast = now; }
+              if (rt.camDirty) { rt.pt.updateCamera(); tmp.camMoved = true; }
+            }
+            rt.geoDirty = rt.matDirty = rt.camDirty = false; rt.drawn = -1; tmp.on = true;
           }
           const compiling = rt.pt.isCompiling;
           if (rt.pt.samples < rt.max) {
             if (!compiling && gap < 200) {
               // steer samples per frame by frame time
-              if (gap < 19) { rt.slow = 0; if (++rt.fast > 10) { rt.fast = 0; rt.spf = Math.min(12, rt.spf + 1); } }
+              if (gap < 19) { rt.slow = 0; if (++rt.fast > 10) { rt.fast = 0; rt.spf = Math.min(4, rt.spf + 1); } }
               else if (gap > 30) {
                 rt.fast = 0;
                 if (++rt.slow > 3) {
                   rt.slow = 0;
                   if (rt.spf > 1) rt.spf--;
-                  else if (camBusy) rt.liteCam = true;
-                  else if (rt.pt.tiles.x < 3) rt.pt.tiles.set(rt.pt.tiles.x + 1, rt.pt.tiles.x + 1);
+                  else if (camBusy && gap > 60) rt.liteCam = true;
                 }
               }
             }
-            const n = compiling ? 1 : rt.spf;
+            // one sample per frame while the camera moves; a few more once it rests, to finish quickly
+            const n = compiling || camBusy ? 1 : rt.spf;
             for (let k = 0; k < n && rt.pt.samples < rt.max; k++) rt.pt.renderSample();
           }
-          if (rt.pt.samples >= 1) { if (rt.pt.samples !== rt.drawn || needsRender) tracedRender(); }
-          else if (needsRender) rasterRender();
+          if (rt.pt.samples >= 1) {
+            if (rt.pt.samples !== rt.drawn || needsRender) {
+              let texture = rt.pt.target.texture;
+              if (tmp.on) { texture = temporalStep(now); if (!camBusy && rt.pt.samples >= 48) tmp.on = false; }
+              tracedRender(texture);
+            }
+          } else if (needsRender) rasterRender();
           setBadge(compiling ? 'ray tracing · compiling shaders' : 'ray tracing · ' + Math.floor(rt.pt.samples) + ' / ' + rt.max + ' samples');
           return;
         } catch (err) {
@@ -1272,7 +1377,12 @@ async function init3D() {
     const w = Math.max(2, stage.clientWidth), h = Math.max(2, stage.clientHeight);
     renderer.setSize(w, h, false);
     composer.setSize(w, h);
-    if (rt.composer) { rt.composer.setSize(w, h); const pr = renderer.getPixelRatio(); rt.overlay.setSize(Math.round(w * pr), Math.round(h * pr)); }
+    if (rt.composer) {
+      const pr = renderer.getPixelRatio(), bw = Math.round(w * pr), bh = Math.round(h * pr);
+      rt.composer.setSize(w, h); rt.overlay.setSize(bw, bh);
+      for (const t of [...tmp.hist, ...tmp.pos]) t.setSize(bw, bh);
+      tmp.reset = true;
+    }
     camera.aspect = w / h; camera.updateProjectionMatrix();
     if (!userMoved) resetView();
     camChanged();
@@ -1303,7 +1413,7 @@ async function init3D() {
   canvas.addEventListener('pointerleave', () => { api.onHover(-1); hideTip(); });
   canvas.addEventListener('dblclick', (e) => { const h = pick(e); if (h && h.i >= 0) api.onUnfold(S.rows3[h.i]); });
 
-  const api = { software, setRows, setCursor, setHover, setTags, setRT, setGlass, resetView, touch, frame, onHover: () => {}, onPick: () => {}, onUnfold: () => {}, debug: { rt, scene, camera, renderer } };
+  const api = { software, setRows, setCursor, setHover, setTags, setRT, setGlass, resetView, touch, frame, onHover: () => {}, onPick: () => {}, onUnfold: () => {}, debug: { rt, tmp, scene, camera, renderer, THREE } };
   resize();
   setRows();
   return api;
