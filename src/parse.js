@@ -1,8 +1,12 @@
 // Parse a strace log recorded with
-//   strace --trace=execve,execveat,exit,exit_group --follow-forks --string-limit=1000 -ttt --output=... <command>
+//   strace --trace=execve,execveat,exit,exit_group,clone,clone3,fork,vfork --follow-forks --string-limit=1000 -ttt --output=... <command>
 // into a compact trace:
-//   { command, span, programs: [name], procs: [[startMs, endMs, programIndex, parentIndex, exitCode, command]] }
+//   { command, span, exact, programs: [name], procs: [[startMs, endMs, programIndex, parentIndex, exitCode, command]] }
 // procs are sorted by start time; parentIndex is -1 for the first process; exitCode is -1 when killed by a signal.
+//
+// Parents come from the fork records (clone, clone3, fork, vfork) when the log has them; `exact` is then true.
+// Logs without them fall back to SIGCHLD: the process that receives SIGCHLD for a child is its parent. That misses
+// children whose signal was merged with another's or never delivered, and those hang off the first process.
 
 const LINE = /^(\d+)\s+(\d+\.\d+)\s+(.*)$/;
 const EXECVE = /^execve\("([^"]*)", \[(.*)\], (?:0x[0-9a-f]+|\[)/;
@@ -12,10 +16,20 @@ const SIGCHLD = /^--- SIGCHLD \{.*?si_code=(?:CLD_EXITED|CLD_KILLED|CLD_DUMPED),
 const EXITED = /^\+\+\+ exited with (\d+) \+\+\+/;
 const KILLED = /^\+\+\+ killed by \w+/;
 const EXITCALL = /^exit(?:_group)?\((\d+)\)/;
+const FORK_CALL = /^(?:clone3?|v?fork)\(/;
+const FORK_RESUMED = /^<\.\.\. (?:clone3?|v?fork) resumed>/;
+const FORK_RESULT = /=\s*(\d+)\s*$/;
 
 export function parseStraceLog(text) {
   const cur = new Map(), recs = [], parentOf = new Map();
-  let tLast = 0;
+  const forkedBy = new Map(), threadOf = new Map(), pendingThread = new Map();
+  const owner = (tid) => (threadOf.has(tid) ? threadOf.get(tid) : tid);
+  let tLast = 0, exact = false;
+  // a successful fork-like call: a new thread joins its creator's process, anything else is a child of it
+  const forked = (pid, child, isThread) => {
+    exact = true;
+    if (isThread) threadOf.set(child, owner(pid)); else forkedBy.set(child, owner(pid));
+  };
   for (const raw of text.split('\n')) {
     const m = LINE.exec(raw);
     if (!m) continue;
@@ -32,9 +46,22 @@ export function parseStraceLog(text) {
         // exec chain: the same process replaced its image
         r.program = e[1]; r.cmd = cmd;
       } else {
-        r = { pid, start: t, end: null, program: e[1], cmd, exit: 0 };
+        r = { pid, start: t, end: null, program: e[1], cmd, exit: 0, par: null };
+        // nearest ancestor that exec'd and is still running; forks that never exec (subshells) are skipped
+        for (let q = forkedBy.get(pid), hops = 0; q !== undefined && hops < 64; q = forkedBy.get(q), hops++) {
+          const cand = cur.get(q);
+          if (cand && cand.end === null) { r.par = cand; break; }
+        }
         cur.set(pid, r); recs.push(r);
       }
+    } else if (FORK_CALL.test(rest)) {
+      const isThread = rest.includes('CLONE_THREAD'), done = FORK_RESULT.exec(rest);
+      if (done) forked(pid, +done[1], isThread);
+      else if (rest.includes('<unfinished')) pendingThread.set(pid, isThread);
+    } else if (FORK_RESUMED.test(rest)) {
+      const done = FORK_RESULT.exec(rest);
+      if (done) forked(pid, +done[1], pendingThread.get(pid) === true || rest.includes('CLONE_THREAD'));
+      pendingThread.delete(pid);
     } else if ((x = EXITCALL.exec(rest))) {
       const r = cur.get(pid);
       if (r && r.end === null) { r.end = t; if (rest.startsWith('exit_group')) r.exit = +x[1]; }
@@ -46,10 +73,10 @@ export function parseStraceLog(text) {
       if (r && (r.end === null || t - r.end < 1e-3)) { if (r.end === null) r.end = t; r.exit = -1; }
     } else if ((x = SIGCHLD.exec(rest))) {
       // the process that receives SIGCHLD for a child is that child's parent
-      parentOf.set(+x[1], pid);
+      parentOf.set(+x[1], owner(pid));
     }
   }
-  if (!recs.length) return { command: '', span: 0, programs: [], procs: [] };
+  if (!recs.length) return { command: '', span: 0, exact: false, programs: [], procs: [] };
   for (const r of recs) if (r.end === null) r.end = tLast;
   recs.sort((a, b) => a.start - b.start);
   const byPid = new Map();
@@ -59,8 +86,8 @@ export function parseStraceLog(text) {
   for (const r of recs) if (r.end > tEnd) tEnd = r.end;
   // Walk up to the nearest ancestor that itself exec'd; anything left over hangs off the first process.
   for (const r of recs) {
-    let q = parentOf.get(r.pid), hops = 0, par = null;
-    while (q !== undefined && hops < 64) {
+    let q = parentOf.get(r.pid), hops = 0, par = r.par;
+    while (!par && q !== undefined && hops < 64) {
       const cand = byPid.get(q);
       if (cand && cand !== r) { par = cand; break; }
       q = parentOf.get(q); hops++;
@@ -74,5 +101,5 @@ export function parseStraceLog(text) {
     const cmd = r.end - r.start >= 0.25 ? (r.cmd.length <= 170 ? r.cmd : r.cmd.slice(0, 96) + ' … ' + r.cmd.slice(-64)) : '';
     return [Math.round((r.start - t0) * 1000), Math.round((r.end - t0) * 1000), index.get(base), r.parent, r.exit, cmd];
   });
-  return { command: recs[0].cmd.slice(0, 120), span: Math.round((tEnd - t0) * 1000) / 1000, programs, procs };
+  return { command: recs[0].cmd.slice(0, 120), span: Math.round((tEnd - t0) * 1000) / 1000, exact, programs, procs };
 }

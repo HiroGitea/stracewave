@@ -11,12 +11,14 @@ const EXAMPLES = [
 const SERIES = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
 const OTHER = '#6f7785';
 const INK = { done: '#0ca30c', running: '#fab219', dot: '#56627a', axis: '#6f7b90', cursor: '#e6ebf4' };
-const BINS_3D = 256, ROW_H = 22, AXIS_H = 24, PITCH = 8, CELL = 6, PLAY_SECONDS = 24;
+const BINS_3D = 256, ROW_H = 22, AXIS_H = 24, MINI_H = 34, TOP = MINI_H + AXIS_H, PITCH = 8, CELL = 6, PLAY_SECONDS = 24;
 
 const S = {
   key: null, procs: [], span: 1, root: null, rows: [], expanded: new Set(),
   t: 0, playing: false, speed: 1, hover: -1, colorOf: new Map(), vmax: 1,
   starts: null, ends: null, failEnds: null,
+  v0: 0, v1: 1, stamp: 0,          // visible time range; stamp invalidates cached series when it changes
+  busy: null, cores: 1, coresFrom: '', chain: [], rowOf: new Map(),
 };
 const dirty = { tl: true, ui: true };
 let view3d = null;
@@ -58,6 +60,7 @@ function buildTree(procs) {
     return (nodeOf[i] = n);
   }
   for (let i = 0; i < procs.length; i++) nodeFor(i);
+  procs.forEach((p, i) => { p.node = nodeOf[i]; });
   (function finalize(n) {
     stats(n);
     n.sub = n.self; n.subFirst = n.first;
@@ -106,13 +109,20 @@ function defaultExpand() {
 }
 
 // Average number of this node's processes alive in each of `bins` equal time bins.
-function seriesOf(n, bins) {
-  let s = n.cache.get(bins);
+// Average number of this node's processes alive in each of `bins` equal time bins, over the visible range
+// (or over the whole trace when `full` is set, for the minimap).
+function seriesOf(n, bins, full) {
+  if (n.stamp !== S.stamp) { n.cache.clear(); n.stamp = S.stamp; }
+  const key = full ? -bins : bins;
+  let s = n.cache.get(key);
   if (s) return s;
+  const v0 = full ? 0 : S.v0, v1 = full ? S.span : S.v1;
   s = new Float32Array(bins);
-  const diff = new Float32Array(bins + 1), bw = S.span / bins, top = bins - 1e-6;
+  const diff = new Float32Array(bins + 1), bw = (v1 - v0) / bins, top = bins - 1e-6;
   for (const p of n.procs) {
-    const a = Math.min(p.start / bw, top), b = Math.min(p.end / bw, top);
+    if (p.start >= v1) break;
+    if (p.end <= v0) continue;
+    const a = Math.min(Math.max(0, (p.start - v0) / bw), top), b = Math.min((p.end - v0) / bw, top);
     const b0 = Math.floor(a), b1 = Math.floor(b);
     if (b0 === b1) { s[b0] += b - a; continue; }
     s[b0] += b0 + 1 - a; s[b1] += b - b1;
@@ -120,9 +130,101 @@ function seriesOf(n, bins) {
   }
   let acc = 0;
   for (let i = 0; i < bins; i++) { acc += diff[i]; s[i] += acc; }
-  n.cache.set(bins, s);
+  n.cache.set(key, s);
   return s;
 }
+
+// One height scale for everything on screen: every row, the busy total and the core line.
+function rescale() {
+  let m = Math.max(1, S.cores);
+  const scan = (n) => { if (!n.procs.length) return; const s = seriesOf(n, BINS_3D); for (let i = 0; i < s.length; i++) if (s[i] > m) m = s[i]; };
+  (function walk(n) { scan(n); if (n.fold) scan(n.fold); n.children.forEach(walk); })(S.root);
+  scan(S.busy);
+  S.vmax = m;
+}
+
+// What the build was actually doing, as opposed to which processes merely existed:
+//  - busy: a process counts only while none of its children is alive (a parent waiting on a child is idle);
+//  - cores: taken from a -jN flag when there is one, otherwise estimated from the busy total;
+//  - chain: walking back from the end, the busy stretch that finished last before each one began. Its long
+//    links are the processes the whole build sat waiting for.
+// Programs that spend their life waiting on what they launch. Old logs recover only part of the process tree, so a
+// waiting parent whose children could not be linked would otherwise look busy for its whole life. Logs recorded
+// with fork tracing have an exact tree and do not need this list.
+const WAITERS = /^(g?make|ninja|samu|cargo|rustup|sh|bash|dash|zsh|env|sudo|time|timeout|nice|xargs|ccache|sccache|distcc|collect2|(.*-)?(gcc|g\+\+|cc|c\+\+)(-\d+)?)$/;
+
+function analyse() {
+  const kids = new Array(S.procs.length);
+  for (const p of S.procs) if (p.parent >= 0) (kids[p.parent] || (kids[p.parent] = [])).push(p);
+  const act = [];
+  for (const p of S.procs) {
+    if (!S.exact && WAITERS.test(p.prog)) continue;
+    const ch = kids[p.i];
+    if (!ch) { act.push({ start: p.start, end: p.end, p }); continue; }
+    let cur = p.start;
+    for (const c of ch) {
+      const a = Math.max(c.start, p.start), b = Math.min(c.end, p.end);
+      if (b <= cur) continue;
+      if (a > cur) act.push({ start: cur, end: a, p });
+      cur = b;
+    }
+    if (cur < p.end) act.push({ start: cur, end: p.end, p });
+  }
+  act.sort((x, y) => x.start - y.start);
+  S.busy = { name: 'busy', procs: act, cache: new Map(), children: [] };
+
+  S.cores = 0; S.coresFrom = '';
+  for (const p of S.procs) {
+    const m = p.cmd && /^(g?make|ninja|cargo|bazel|meson|cmake)$/.test(p.prog) && /(?:^|\s)-j ?(\d+)(?:\s|$)/.exec(p.cmd);
+    if (m && +m[1] > 0) { S.cores = +m[1]; S.coresFrom = 'from -j' + m[1] + ' in the trace'; break; }
+  }
+  if (!S.cores) {
+    const b = Array.from(seriesOf(S.busy, BINS_3D, true)).sort((x, y) => x - y);
+    S.cores = Math.max(1, Math.round(b[Math.floor(b.length * 0.97)]));
+    S.coresFrom = 'estimated from the trace';
+  }
+
+  const iv = act.filter((x) => x.end - x.start >= 0.02).sort((x, y) => x.end - y.end);
+  const ends = Float64Array.from(iv, (x) => x.end), chain = [];
+  for (let k = iv.length - 1; k >= 0;) {
+    const cur = iv[k];
+    chain.push(cur);
+    if (cur.start <= 0.02) break;
+    k = Math.min(ub(ends, cur.start + 0.02) - 1, k - 1);
+  }
+  const floor = Math.max(1, S.span * 0.015);
+  S.chain = chain.filter((x) => x.end - x.start >= floor).sort((x, y) => x.start - y.start);
+}
+
+function setCores(n, from) {
+  S.cores = clamp(Math.round(n) || 1, 1, 4096); S.coresFrom = from;
+  const el = $('#cores'); el.value = String(S.cores); el.title = 'Core line: ' + S.coresFrom;
+  S.stamp++; rescale();
+  dirty.tl = true; refresh3D();
+}
+
+// Visible time range. The timeline follows at once; the 3D ridges are rebuilt a moment later.
+let refreshTimer = 0;
+function refresh3D() { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (view3d) view3d.setRows(); }, 90); }
+const zoomed = () => S.v1 - S.v0 < S.span - 1e-6;
+function setView(a, b) {
+  const minW = Math.max(S.span / 400, 0.05);
+  a = clamp(a, 0, S.span); b = clamp(b, 0, S.span);
+  if (b - a < minW) { a = clamp((a + b) / 2 - minW / 2, 0, S.span - minW); b = a + minW; }
+  if (a === S.v0 && b === S.v1) return;
+  S.v0 = a; S.v1 = b; S.stamp++;
+  rescale();
+  setT(S.t);
+  syncZoom();
+  refresh3D();
+}
+function syncZoom() {
+  const el = $('#zoomReset');
+  if (!el) return;
+  el.hidden = !zoomed();
+  el.textContent = fmtD(S.v0) + ' – ' + fmtD(S.v1) + '  ✕';
+}
+
 const hOf = (v) => (v <= 0 ? 0 : Math.sqrt(Math.min(1, v / S.vmax)));
 const liveCount = (n, t) => ub(n.starts, t) - ub(n.ends, t);
 function stateOf(n, t) {
@@ -155,20 +257,24 @@ function showTrace(key, d) {
   const total = new Map();
   for (const p of S.procs) total.set(p.prog, (total.get(p.prog) || 0) + p.end - p.start);
   S.colorOf = new Map([...total.entries()].sort((a, b) => b[1] - a[1]).slice(0, SERIES.length).map(([name], i) => [name, SERIES[i]]));
+  S.v0 = 0; S.v1 = S.span; S.stamp++;
+  S.exact = !!d.exact;
   S.root = buildTree(S.procs);
+  analyse();
   S.starts = Float64Array.from(S.procs, (p) => p.start).sort();
   S.ends = Float64Array.from(S.procs, (p) => p.end).sort();
   S.failEnds = Float64Array.from(S.procs.filter((p) => p.exit !== 0), (p) => p.end).sort();
-  S.vmax = 1;
-  (function scan(n) { if (n.procs.length) { const s = seriesOf(n, BINS_3D); for (let i = 0; i < s.length; i++) if (s[i] > S.vmax) S.vmax = s[i]; } n.children.forEach(scan); })(S.root);
+  rescale();
+  $('#cores').value = String(S.cores); $('#cores').title = 'Core line: ' + S.coresFrom;
   defaultExpand();
   S.hover = -1;
   S.playing = false;
-  $('#meta').innerHTML = (d.file ? esc(d.file) + ' · ' : '') + '$ ' + esc(cmdLine(d.command)) + ' · <b>' + S.procs.length.toLocaleString() + '</b> processes · <b>' + fmtT(S.span) + '</b>';
+  $('#meta').innerHTML = (d.file ? esc(d.file) + ' · ' : '') + '$ ' + esc(cmdLine(d.command)) + ' · <b>' + S.procs.length.toLocaleString() + '</b> processes · <b>' + fmtT(S.span) + '</b>' +
+    (S.exact ? '' : ' · <span title="This log has no fork records, so some processes could not be linked to their parent and hang off the first process. Record with the strace command in the README for an exact tree.">approximate tree</span>');
   $('#clockEnd').textContent = fmtT(S.span);
   for (const b of $('#datasets').children) b.setAttribute('aria-pressed', String(b.dataset.key === key));
   rowsChanged();
-  const all = seriesOf({ procs: S.procs, cache: new Map() }, BINS_3D);
+  const all = seriesOf({ procs: S.procs, cache: new Map() }, BINS_3D, true);
   let peak = 0;
   for (let i = 1; i < all.length; i++) if (all[i] > all[peak]) peak = i;
   setT(((peak + 0.5) / BINS_3D) * S.span);
@@ -214,7 +320,12 @@ let rowEls = [], tlCols = 0, tlW = 0;
 
 function rowsChanged() {
   S.rows = visibleRows();
-  tlLabels.innerHTML = '<div class="axis-pad">Timeline</div>' + S.rows.map((n, i) => {
+  S.rowOf = new Map();
+  S.rows.forEach((n, i) => {
+    if (S.expanded.has(n.id)) { if (!n.isFold) S.rowOf.set(n, i); }
+    else (function mark(x) { if (!x.isFold) S.rowOf.set(x, i); x.children.forEach(mark); })(n);
+  });
+  tlLabels.innerHTML = '<div class="axis-pad"><span>Timeline</span><button type="button" class="zoom-reset" id="zoomReset" title="Show the whole trace" hidden></button></div>' + S.rows.map((n, i) => {
     const has = n.children.length > 0, open = S.expanded.has(n.id), k = n.procs.length;
     return '<button type="button" class="row" data-i="' + i + '" style="--d:' + n.vdepth + '"' + (has ? ' aria-expanded="' + open + '"' : '') + '>' +
       '<span class="st" data-st=""></span><span class="caret">' + (has ? (open ? '▾' : '▸') : '') + '</span>' +
@@ -222,6 +333,7 @@ function rowsChanged() {
       '<span class="ct">(' + k.toLocaleString() + (k === 1 ? ' unit' : ' units') + ')</span><span class="fl"></span></button>';
   }).join('');
   rowEls = [...tlLabels.querySelectorAll('.row')];
+  syncZoom();
   sizeTimeline();
   if (view3d) view3d.setRows();
   dirty.tl = dirty.ui = true;
@@ -229,7 +341,7 @@ function rowsChanged() {
 
 function sizeTimeline() {
   const dpr = window.devicePixelRatio || 1;
-  const h = AXIS_H + S.rows.length * ROW_H;
+  const h = TOP + S.rows.length * ROW_H;
   tlCanvas.style.height = h + 'px';
   const w = Math.max(40, tlCanvas.clientWidth);
   tlCols = Math.max(8, Math.floor(w / PITCH));
@@ -241,26 +353,59 @@ function sizeTimeline() {
 
 function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))); const f = raw / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p; }
 
+const tickLabel = (v, step) => (step < 1 ? v.toFixed(1) : String(Math.round(v))) + 's';
+const xOfT = (t) => ((t - S.v0) / (S.v1 - S.v0)) * tlW;
+
 function drawTimeline() {
   const dpr = window.devicePixelRatio || 1, ctx = tlCtx;
   const w = tlCanvas.width / dpr, h = tlCanvas.height / dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  // axis
   ctx.font = '11px "JetBrains Mono", ui-monospace, monospace';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = INK.axis;
-  const step = niceStep(S.span / Math.max(2, tlW / 84));
-  for (let v = 0; v <= S.span + 1e-6; v += step) {
-    const x = (v / S.span) * tlW;
-    ctx.globalAlpha = 0.5; ctx.fillRect(Math.round(x), AXIS_H - 5, 1, 4); ctx.globalAlpha = 1;
-    if (x + 30 < w) ctx.fillText(Math.round(v) + 's', x + 4, AXIS_H / 2 - 1);
+
+  // minimap: busy processes over the whole trace, the core line, and the window being viewed
+  const mini = seriesOf(S.busy, tlCols, true), mh = MINI_H - 10;
+  let mmax = S.cores;
+  for (let c = 0; c < tlCols; c++) if (mini[c] > mmax) mmax = mini[c];
+  const c0 = Math.floor((S.v0 / S.span) * tlCols), c1 = Math.ceil((S.v1 / S.span) * tlCols);
+  for (let c = 0; c < tlCols; c++) {
+    if (mini[c] < 0.02) continue;
+    const bh = Math.max(1, Math.round((mini[c] / mmax) * mh));
+    ctx.fillStyle = c >= c0 && c < c1 ? '#8494ad' : '#39445a';
+    ctx.fillRect(c * PITCH, MINI_H - 4 - bh, CELL, bh);
   }
-  if (S.hover >= 0 && S.hover < S.rows.length) { ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(0, AXIS_H + S.hover * ROW_H, w, ROW_H); }
-  const cur = Math.min(tlCols - 1, Math.floor((S.t / S.span) * tlCols));
+  const cy = Math.round(MINI_H - 4 - (S.cores / mmax) * mh) + 0.5;
+  ctx.strokeStyle = '#8fd3ff'; ctx.globalAlpha = 0.8; ctx.setLineDash([4, 3]);
+  ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(tlW, cy); ctx.stroke();
+  ctx.setLineDash([]); ctx.globalAlpha = 1;
+  const coreText = S.cores + (S.cores === 1 ? ' core' : ' cores');
+  ctx.fillStyle = '#8fd3ff'; ctx.textAlign = 'right';
+  ctx.fillText(coreText, tlW - 2, cy > 12 ? cy - 7 : cy + 8);
+  ctx.textAlign = 'left';
+  if (zoomed()) {
+    const xa = (S.v0 / S.span) * tlW, xb = (S.v1 / S.span) * tlW;
+    ctx.strokeStyle = '#8fd3ff'; ctx.lineWidth = 1;
+    ctx.strokeRect(Math.round(xa) + 0.5, 1.5, Math.max(2, Math.round(xb - xa) - 1), MINI_H - 3);
+  }
+  const mx = Math.round((S.t / S.span) * tlW) + 0.5;
+  ctx.strokeStyle = INK.cursor; ctx.globalAlpha = 0.7;
+  ctx.beginPath(); ctx.moveTo(mx, 2); ctx.lineTo(mx, MINI_H - 2); ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // axis for the visible range
+  ctx.fillStyle = INK.axis;
+  const step = niceStep((S.v1 - S.v0) / Math.max(2, tlW / 84));
+  for (let v = Math.ceil(S.v0 / step - 1e-9) * step; v <= S.v1 + 1e-6; v += step) {
+    const x = xOfT(v);
+    ctx.globalAlpha = 0.5; ctx.fillRect(Math.round(x), TOP - 5, 1, 4); ctx.globalAlpha = 1;
+    if (x + 34 < w) ctx.fillText(tickLabel(v, step), x + 4, MINI_H + AXIS_H / 2 - 1);
+  }
+  if (S.hover >= 0 && S.hover < S.rows.length) { ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(0, TOP + S.hover * ROW_H, w, ROW_H); }
+  const cur = Math.min(tlCols - 1, Math.floor(((S.t - S.v0) / (S.v1 - S.v0)) * tlCols));
   const maxH = ROW_H - 8;
   for (let r = 0; r < S.rows.length; r++) {
-    const s = seriesOf(S.rows[r], tlCols), base = AXIS_H + r * ROW_H + ROW_H - 4;
+    const s = seriesOf(S.rows[r], tlCols), base = TOP + r * ROW_H + ROW_H - 4;
     for (let c = 0; c < tlCols; c++) {
       const v = s[c];
       if (v < 0.002) continue;
@@ -271,10 +416,18 @@ function drawTimeline() {
       ctx.fillRect(x, base - bh, CELL, bh);
     }
   }
-  const cx = Math.round((S.t / S.span) * tlW) + 0.5;
+  // the long links of the critical chain, underlined on the row that holds each process
+  ctx.fillStyle = INK.cursor;
+  for (const seg of S.chain) {
+    const r = S.rowOf.get(seg.p.node);
+    if (r === undefined || seg.end <= S.v0 || seg.start >= S.v1) continue;
+    const xa = Math.max(0, xOfT(seg.start)), xb = Math.min(tlW, xOfT(seg.end));
+    ctx.fillRect(xa, TOP + r * ROW_H + ROW_H - 3, Math.max(2, xb - xa), 2);
+  }
+  const cx = Math.round(xOfT(S.t)) + 0.5;
   ctx.strokeStyle = INK.cursor; ctx.globalAlpha = 0.85; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(cx, AXIS_H - 6); ctx.lineTo(cx, h); ctx.stroke();
-  ctx.fillStyle = INK.cursor; ctx.beginPath(); ctx.moveTo(cx - 4, AXIS_H - 10); ctx.lineTo(cx + 4, AXIS_H - 10); ctx.lineTo(cx, AXIS_H - 4); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx, TOP - 6); ctx.lineTo(cx, h); ctx.stroke();
+  ctx.fillStyle = INK.cursor; ctx.beginPath(); ctx.moveTo(cx - 4, TOP - 10); ctx.lineTo(cx + 4, TOP - 10); ctx.lineTo(cx, TOP - 4); ctx.closePath(); ctx.fill();
   ctx.globalAlpha = 1;
 }
 
@@ -296,7 +449,7 @@ function updateUI() {
   $('#clockT').textContent = fmtT(t);
   $('#sliceT').textContent = fmtT(t);
   const scrub = $('#scrub');
-  if (document.activeElement !== scrub || S.playing) scrub.value = String(Math.round((t / S.span) * 1000));
+  if (document.activeElement !== scrub || S.playing) scrub.value = String(Math.round(((t - S.v0) / (S.v1 - S.v0)) * 1000));
   // slice panel: who is alive right now, longest-running first
   const live = [];
   for (const p of S.procs) { if (p.start > t) break; if (t < p.end) live.push(p); }
@@ -337,16 +490,17 @@ function setHover(i) {
   if (view3d) view3d.setHover(i);
 }
 function setT(t) {
-  S.t = clamp(t, 0, S.span);
+  S.t = clamp(t, S.v0, S.v1);
   dirty.tl = dirty.ui = true;
   if (view3d) view3d.setCursor();
 }
 function syncPlay() { const b = $('#play'); b.textContent = S.playing ? '❚❚' : '▶'; b.setAttribute('aria-label', S.playing ? 'Pause' : 'Play'); if (view3d) view3d.touch(); }
-function togglePlay() { if (!S.playing && S.t >= S.span - 1e-6) setT(0); S.playing = !S.playing; syncPlay(); }
+function togglePlay() { if (!S.playing && S.t >= S.v1 - 1e-6) setT(S.v0); S.playing = !S.playing; syncPlay(); }
 let toastTimer = 0;
 function toast(text, ms = 1600) { const el = $('#toast'); el.textContent = text; el.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; }, ms); }
 
 tlLabels.addEventListener('click', (e) => {
+  if (e.target.closest('#zoomReset')) { setView(0, S.span); return; }
   const b = e.target.closest('.row'); if (!b) return;
   const n = S.rows[+b.dataset.i]; if (!n || !n.children.length) return;
   if (S.expanded.has(n.id)) S.expanded.delete(n.id); else S.expanded.add(n.id);
@@ -357,22 +511,47 @@ tlLabels.addEventListener('click', (e) => {
 tlLabels.addEventListener('pointerover', (e) => { const b = e.target.closest('.row'); setHover(b ? +b.dataset.i : -1); });
 tlLabels.addEventListener('pointerleave', () => setHover(-1));
 
-let scrubbing = false;
-const tlTime = (e) => { const r = tlCanvas.getBoundingClientRect(); return clamp((e.clientX - r.left) / tlW, 0, 1) * S.span; };
-tlCanvas.addEventListener('pointerdown', (e) => { scrubbing = true; tlCanvas.setPointerCapture(e.pointerId); setT(tlTime(e)); });
-tlCanvas.addEventListener('pointermove', (e) => {
-  const r = tlCanvas.getBoundingClientRect(), i = Math.floor((e.clientY - r.top - AXIS_H) / ROW_H), t = tlTime(e);
-  if (scrubbing) setT(t);
-  if (i >= 0 && i < S.rows.length) { setHover(i); showTip(nodeTip(S.rows[i], t), e.clientX, e.clientY); } else { setHover(-1); hideTip(); }
+let drag = null;
+const tlPos = (e) => { const r = tlCanvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+const tlTime = (x) => S.v0 + clamp(x / tlW, 0, 1) * (S.v1 - S.v0);
+const miniTime = (x) => clamp(x / tlW, 0, 1) * S.span;
+tlCanvas.addEventListener('pointerdown', (e) => {
+  const { x, y } = tlPos(e);
+  tlCanvas.setPointerCapture(e.pointerId);
+  if (y >= MINI_H) { drag = { mode: 'scrub' }; setT(tlTime(x)); return; }
+  const t = miniTime(x);
+  drag = zoomed() && t >= S.v0 && t <= S.v1 ? { mode: 'pan', t, v0: S.v0, v1: S.v1 } : { mode: 'brush', t, x, moved: false };
 });
-const endScrub = () => { scrubbing = false; };
-tlCanvas.addEventListener('pointerup', endScrub);
-tlCanvas.addEventListener('pointercancel', endScrub);
-tlCanvas.addEventListener('pointerleave', () => { if (!scrubbing) { setHover(-1); hideTip(); } });
+tlCanvas.addEventListener('pointermove', (e) => {
+  const { x, y } = tlPos(e);
+  if (drag && drag.mode === 'scrub') setT(tlTime(x));
+  else if (drag && drag.mode === 'pan') { const w = drag.v1 - drag.v0, a = clamp(drag.v0 + miniTime(x) - drag.t, 0, S.span - w); setView(a, a + w); }
+  else if (drag && drag.mode === 'brush') {
+    if (Math.abs(x - drag.x) > 3) drag.moved = true;
+    if (drag.moved) { const t = miniTime(x); setView(Math.min(drag.t, t), Math.max(drag.t, t)); }
+  }
+  const i = Math.floor((y - TOP) / ROW_H);
+  if (y >= TOP && i < S.rows.length) { setHover(i); showTip(nodeTip(S.rows[i], tlTime(x)), e.clientX, e.clientY); }
+  else if (y < MINI_H) {
+    setHover(-1);
+    const t = miniTime(x), s = seriesOf(S.busy, tlCols, true), c = Math.min(tlCols - 1, Math.floor((t / S.span) * tlCols));
+    showTip('<div class="p">' + fmtT(t) + ' · ' + s[c].toFixed(1) + ' busy</div><div class="c">Drag to zoom into a range. Double-click to show everything.</div>', e.clientX, e.clientY);
+  } else { setHover(-1); hideTip(); }
+});
+const endDrag = () => {
+  // a plain click on the minimap while zoomed moves the window there
+  if (drag && drag.mode === 'brush' && !drag.moved && zoomed()) { const w = S.v1 - S.v0, a = clamp(drag.t - w / 2, 0, S.span - w); setView(a, a + w); }
+  drag = null;
+};
+tlCanvas.addEventListener('pointerup', endDrag);
+tlCanvas.addEventListener('pointercancel', endDrag);
+tlCanvas.addEventListener('pointerleave', () => { if (!drag) { setHover(-1); hideTip(); } });
+tlCanvas.addEventListener('dblclick', (e) => { if (tlPos(e).y < MINI_H) setView(0, S.span); });
+$('#cores').addEventListener('change', (e) => setCores(+e.target.value, 'set by you'));
 
 $('#play').addEventListener('click', togglePlay);
 $('#speeds').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; S.speed = +b.dataset.speed; for (const x of $('#speeds').children) x.setAttribute('aria-pressed', String(x === b)); });
-$('#scrub').addEventListener('input', (e) => setT((+e.target.value / 1000) * S.span));
+$('#scrub').addEventListener('input', (e) => setT(S.v0 + (+e.target.value / 1000) * (S.v1 - S.v0)));
 $('#datasets').innerHTML = EXAMPLES.map((e) => '<button type="button" data-key="' + e.key + '" aria-pressed="false">' + esc(e.name) + '</button>').join('');
 $('#datasets').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b && b.dataset.key !== S.key) openExample(b.dataset.key); });
 $('#openLog').addEventListener('click', () => $('#logFile').click());
@@ -423,7 +602,7 @@ async function init3D() {
   renderer.toneMappingExposure = 1.05;
 
   const W = 24, X0 = -12, H = 4.6, Y0 = 0.012;
-  const xOf = (t) => X0 + (t / S.span) * W;
+  const xOf = (t) => X0 + ((t - S.v0) / (S.v1 - S.v0)) * W;
   let dz = 0.7, D = 8;
   const zOf = (i) => D / 2 - i * dz;
 
@@ -550,7 +729,7 @@ async function init3D() {
   }
 
   function sampleRow(i, t) {
-    const s = series[i], f = clamp((t / S.span) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
+    const s = series[i], f = clamp(((t - S.v0) / (S.v1 - S.v0)) * BINS_3D - 0.5, 0, BINS_3D - 1), a = Math.floor(f), b = Math.min(BINS_3D - 1, a + 1);
     return Y0 + H * hOf(s[a] + (s[b] - s[a]) * (f - a));
   }
 
@@ -627,12 +806,12 @@ async function init3D() {
     frameTop.scale.set(0.02, 0.02, D + 1.6); frameTop.position.set(0, SH, 0);
     frameA.scale.set(0.02, SH, 0.02); frameA.position.set(0, SH / 2, SZ);
     frameB.scale.set(0.02, SH, 0.02); frameB.position.set(0, SH / 2, -SZ);
-    const step = niceStep(S.span / 8);
+    const step = niceStep((S.v1 - S.v0) / 8);
     labelsEl.textContent = ''; tickLabels = []; rowLabels = [];
-    for (let v = 0; v <= S.span + 1e-6; v += step) {
+    for (let v = Math.ceil(S.v0 / step - 1e-9) * step; v <= S.v1 + 1e-6; v += step) {
       const m = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.004, D + 1.6), tickMat);
       m.position.set(xOf(v), 0.003, 0); ticks.add(m);
-      const el = document.createElement('span'); el.className = 'tick'; el.textContent = Math.round(v) + 's';
+      const el = document.createElement('span'); el.className = 'tick'; el.textContent = tickLabel(v, step);
       labelsEl.appendChild(el); tickLabels.push({ el, p: new THREE.Vector3(xOf(v), 0, D / 2 + 1.25) });
     }
     S.rows.forEach((n, i) => {
@@ -826,8 +1005,8 @@ async function init3D() {
     ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
     ray.setFromCamera(ndc, camera);
     const hit = ray.intersectObjects(bodies, false)[0];
-    if (hit) return { i: hit.object.userData.i, t: clamp((hit.point.x - X0) / W, 0, 1) * S.span };
-    return ray.ray.intersectPlane(ground, hitV) && Math.abs(hitV.z) < D / 2 + 1.5 && hitV.x > X0 - 0.5 && hitV.x < X0 + W + 0.5 ? { i: -1, t: clamp((hitV.x - X0) / W, 0, 1) * S.span } : null;
+    if (hit) return { i: hit.object.userData.i, t: S.v0 + clamp((hit.point.x - X0) / W, 0, 1) * (S.v1 - S.v0) };
+    return ray.ray.intersectPlane(ground, hitV) && Math.abs(hitV.z) < D / 2 + 1.5 && hitV.x > X0 - 0.5 && hitV.x < X0 + W + 0.5 ? { i: -1, t: S.v0 + clamp((hitV.x - X0) / W, 0, 1) * (S.v1 - S.v0) } : null;
   }
   let down = null;
   canvas.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY]; hideTip(); });
@@ -850,8 +1029,8 @@ let last = performance.now(), lastUI = 0;
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now;
   if (S.playing) {
-    setT(S.t + dt * (S.span / PLAY_SECONDS) * S.speed);
-    if (S.t >= S.span) { S.playing = false; syncPlay(); }
+    setT(S.t + dt * ((S.v1 - S.v0) / PLAY_SECONDS) * S.speed);
+    if (S.t >= S.v1) { S.playing = false; syncPlay(); }
   }
   if (dirty.tl) { drawTimeline(); dirty.tl = false; }
   if (dirty.ui && now - lastUI > 90) { updateUI(); dirty.ui = false; lastUI = now; }
